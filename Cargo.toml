@@ -1,0 +1,18 @@
+[package]
+name = "razerd"
+version = "2026.3.15"
+edition = "2024"
+license = "MIT"
+description = "Minimal Razer RGB daemon for Linux"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
