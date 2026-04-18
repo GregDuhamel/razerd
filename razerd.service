@@ -1,0 +1,9 @@
+[Unit]
+Description=Razer RGB color sync (dock + mouse)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/razerd --color blue
+
+[Install]
+WantedBy=default.target
