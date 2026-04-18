@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic low-battery check for Razer mouse
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=razerd-battery-notify.service
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

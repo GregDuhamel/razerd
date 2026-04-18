@@ -1,0 +1,41 @@
+#!/bin/sh
+# Poll the mouse battery and send a desktop notification when it drops
+# below the threshold. Designed to be called from a systemd user timer.
+#
+# Config (env vars):
+#   RAZERD_LOW_BATTERY  — percentage threshold, default 20
+#   RAZERD_BIN          — path to the razerd binary, default "razerd"
+
+set -eu
+
+BIN="${RAZERD_BIN:-razerd}"
+THRESHOLD="${RAZERD_LOW_BATTERY:-20}"
+STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/razerd-low-battery-notified"
+
+output=$("$BIN" --battery 2>/dev/null) || exit 0
+
+# Match "✓ Battery: NN%" optionally followed by " (charging)".
+percent=$(printf '%s\n' "$output" | sed -n 's/.*Battery:[[:space:]]*\([0-9]\{1,3\}\)%.*/\1/p')
+case "$percent" in
+    '' | *[!0-9]*) exit 0 ;;
+esac
+
+charging=0
+case "$output" in
+    *charging*) charging=1 ;;
+esac
+
+if [ "$percent" -lt "$THRESHOLD" ] && [ "$charging" -eq 0 ]; then
+    if [ ! -f "$STATE_FILE" ]; then
+        notify-send \
+            --urgency=critical \
+            --app-name=razerd \
+            --icon=battery-caution \
+            "Razer mouse battery low" \
+            "${percent}% remaining — dock the mouse to charge."
+        : > "$STATE_FILE"
+    fi
+else
+    # Re-arm once the battery recovers or the mouse is docked.
+    rm -f "$STATE_FILE"
+fi

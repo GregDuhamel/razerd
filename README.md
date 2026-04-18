@@ -116,6 +116,25 @@ systemctl --user edit razerd.timer       # change OnUnitActiveSec interval
 
 Remove with `make uninstall-service`.
 
+### 4. (Optional) Low-battery desktop notifications
+
+```bash
+make install-notify
+```
+
+Installs a shell helper (`razerd-battery-notify`) together with a systemd user timer that polls `razerd --battery` every 5 minutes and fires a `notify-send` notification when the level drops below 20% and the mouse is not charging.
+
+Tune the threshold with a drop-in:
+
+```bash
+systemctl --user edit razerd-battery-notify.service
+# then add:
+#   [Service]
+#   Environment=RAZERD_LOW_BATTERY=15
+```
+
+Remove with `make uninstall-notify`.
+
 ## How it works
 
 razerd communicates with the dock via the Linux `hidraw` interface using `HIDIOCSFEATURE` ioctls — no kernel driver detachment, no libusb.

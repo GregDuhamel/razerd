@@ -1,0 +1,6 @@
+[Unit]
+Description=Notify on low Razer mouse battery
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/razerd-battery-notify
