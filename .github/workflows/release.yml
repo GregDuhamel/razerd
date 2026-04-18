@@ -14,9 +14,9 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute version (YYYY.MM.DD)
+      - name: Compute version (YYYY.M.D, semver-compatible)
         id: version
-        run: echo "version=$(date -u +'%Y.%m.%d')" >> $GITHUB_OUTPUT
+        run: echo "version=$(date -u +'%Y.%-m.%-d')" >> $GITHUB_OUTPUT
 
       - name: Update Cargo.toml version
         run: sed -i 's/^version = .*/version = "${{ steps.version.outputs.version }}"/' Cargo.toml
