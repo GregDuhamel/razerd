@@ -1,0 +1,11 @@
+[Unit]
+Description=Re-apply Razer RGB color periodically (survives wireless RF reconnects)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+Unit=razerd.service
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

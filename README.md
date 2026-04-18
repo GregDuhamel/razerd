@@ -89,13 +89,17 @@ Log out and back in, then verify:
 razerd --check
 ```
 
-### 3. (Optional) systemd user service for auto-apply at login/boot
+### 3. (Optional) systemd user service + timer
 
 ```bash
 make install-service
 ```
 
-This installs `~/.config/systemd/user/razerd.service` and enables it so the color (blue by default) is applied automatically on session start.
+This installs and enables:
+- `razerd.service` — applies the color once (blue by default)
+- `razerd.timer` — re-fires the service every 30 seconds
+
+The timer is important: when the wireless mouse drops off the dock's RF link (power save, lifted off the dock, etc.) it may forget the color. Re-applying periodically keeps everything in sync, which is exactly what Razer Synapse does on Windows.
 
 To also run at **boot** before you log in:
 
@@ -106,8 +110,8 @@ sudo loginctl enable-linger $USER
 **Change the color** without editing the file manually:
 
 ```bash
-systemctl --user edit razerd.service
-# add an override with a new ExecStart, or replace the color
+systemctl --user edit razerd.service     # change ExecStart
+systemctl --user edit razerd.timer       # change OnUnitActiveSec interval
 ```
 
 Remove with `make uninstall-service`.
