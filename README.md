@@ -39,31 +39,26 @@ razerd --color off
 
 ## Installation
 
-### Build and install
+### 1. Build and install the binary
 
 ```bash
 make install
 ```
 
-This runs `cargo build --release` and installs the binary to `~/.local/bin/razerd` (override with `PREFIX=...`, e.g. `PREFIX=/usr/local sudo -E make install` for a system-wide install). To remove it: `make uninstall`.
+Installs to `~/.local/bin/razerd`. Override with `PREFIX=/usr/local sudo -E make install` for a system-wide install. Make sure `~/.local/bin` is in your `PATH`.
 
-Make sure `~/.local/bin` is in your `PATH`.
+Remove with `make uninstall`.
 
-### udev rules (required to run without sudo)
+### 2. udev rules (grant non-root access to the dock)
 
 ```bash
 sudo tee /etc/udev/rules.d/99-razerd.rules << 'EOF'
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1532", ATTR{idProduct}=="00a4", GROUP="razerd", MODE="0660"
 KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00a4", GROUP="razerd", MODE="0660"
 EOF
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
-
-Create the group and add your user:
-
-```bash
 sudo groupadd -f razerd
 sudo usermod -aG razerd $USER
+sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 Log out and back in, then verify:
@@ -71,6 +66,29 @@ Log out and back in, then verify:
 ```bash
 razerd --check
 ```
+
+### 3. (Optional) systemd user service for auto-apply at login/boot
+
+```bash
+make install-service
+```
+
+This installs `~/.config/systemd/user/razerd.service` and enables it so the color (blue by default) is applied automatically on session start.
+
+To also run at **boot** before you log in:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+**Change the color** without editing the file manually:
+
+```bash
+systemctl --user edit razerd.service
+# add an override with a new ExecStart, or replace the color
+```
+
+Remove with `make uninstall-service`.
 
 ## How it works
 
@@ -86,6 +104,21 @@ The Razer Mouse Dock Pro (`1532:00A4`) exposes three HID interfaces on USB. All 
 The protocol was reverse-engineered from USB captures of Razer Synapse on Windows using Wireshark.
 
 > **Note:** Do not send HID feature reports to interface 2 (`/dev/hidraw2`) — it causes the dock firmware to reboot.
+
+## Development
+
+```bash
+make build          # cargo build --release
+make install        # build + copy to ~/.local/bin/
+make install-service # install + enable systemd user service
+make uninstall
+make uninstall-service
+make clean          # cargo clean
+```
+
+CI runs `cargo fmt --check`, `cargo check`, `cargo clippy -D warnings`, `cargo doc -D warnings`, and a release build on every push and PR.
+
+Releases are cut via the **Release** GitHub Action (`workflow_dispatch`) — pick a semver bump (patch/minor/major), the workflow computes the next version from the latest tag, bumps `Cargo.toml`, tags, builds, and attaches the Linux binary to the GitHub Release.
 
 ## Dependencies
 
