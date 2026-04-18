@@ -30,6 +30,9 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: cargo test
+        run: cargo test --locked --all-targets
+
       - name: cargo doc
         run: cargo doc --locked --no-deps --document-private-items
         env:
