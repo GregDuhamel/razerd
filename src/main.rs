@@ -22,14 +22,17 @@ fn hidiocgfeature(len: usize) -> u64 {
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Cli {
-    #[arg(long, conflicts_with_all = ["color", "battery"])]
+    #[arg(long, conflicts_with_all = ["color", "battery", "info"])]
     check: bool,
 
-    #[arg(long, value_enum, conflicts_with_all = ["check", "battery"])]
+    #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info"])]
     color: Option<ColorName>,
 
-    #[arg(long, conflicts_with_all = ["check", "color"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "info"])]
     battery: bool,
+
+    #[arg(long, conflicts_with_all = ["check", "color", "battery"])]
+    info: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -316,35 +319,63 @@ fn compute_crc(bytes: &[u8; REPORT_LEN]) -> u8 {
     bytes[2..88].iter().fold(0u8, |acc, byte| acc ^ byte)
 }
 
+// Razer HID query (SET_REPORT + GET_REPORT):
+//   byte[1] = tx_id, byte[5] = data_size, byte[6] = class, byte[7] = cmd,
+//   byte[8..8+args.len()] = request arguments, byte[88] = XOR CRC.
+// Mouse-targeted queries use tx_id in the mouse range (< 0xF7); dock-targeted use 0xFF.
+fn build_query(tx_id: u8, class: u8, cmd: u8, data_size: u8, args: &[u8]) -> [u8; REPORT_LEN] {
+    let mut bytes = [0u8; REPORT_LEN];
+    bytes[1] = tx_id;
+    bytes[5] = data_size;
+    bytes[6] = class;
+    bytes[7] = cmd;
+    bytes[8..8 + args.len()].copy_from_slice(args);
+    bytes[88] = compute_crc(&bytes);
+    bytes
+}
+
 #[derive(Debug)]
 struct BatteryStatus {
     percent: u8,
     charging: bool,
 }
 
-// Razer power class: 0x07/0x80 = battery level, 0x07/0x84 = charging status.
-// Response arrives on arguments[1] (report byte[9]): 0-255 for level, 0/1 for charging.
-fn battery_query_report(command_id: u8) -> [u8; REPORT_LEN] {
-    let mut bytes = [0u8; REPORT_LEN];
-    bytes[1] = 0x1F; // tx_id
-    bytes[5] = 0x02; // data_size
-    bytes[6] = 0x07; // class: power
-    bytes[7] = command_id;
-    bytes[88] = compute_crc(&bytes);
-    bytes
-}
-
 fn query_battery(file: &std::fs::File) -> Result<BatteryStatus> {
-    let level_resp = exchange_feature_report(file, &battery_query_report(0x80))
+    let level_resp = exchange_feature_report(file, &build_query(0x1F, 0x07, 0x80, 0x02, &[]))
         .context("battery level query failed")?;
-    let charge_resp = exchange_feature_report(file, &battery_query_report(0x84))
+    let charge_resp = exchange_feature_report(file, &build_query(0x1F, 0x07, 0x84, 0x02, &[]))
         .context("charging status query failed")?;
 
-    let raw_level = level_resp[9];
-    let percent = ((raw_level as u32 * 100) / 255) as u8;
+    // Response arguments[1] = byte[9]: 0-255 for level, 0/1 for charging.
+    let percent = ((level_resp[9] as u32 * 100) / 255) as u8;
     let charging = charge_resp[9] != 0;
 
     Ok(BatteryStatus { percent, charging })
+}
+
+fn query_serial(file: &std::fs::File, tx_id: u8) -> Result<String> {
+    let resp = exchange_feature_report(file, &build_query(tx_id, 0x00, 0x82, 0x16, &[]))
+        .context("serial query failed")?;
+    // Serial is an ASCII string in arguments[0..22] = bytes[8..30], zero-terminated.
+    let raw = &resp[8..30];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    Ok(String::from_utf8_lossy(&raw[..end]).trim().to_string())
+}
+
+fn query_firmware(file: &std::fs::File, tx_id: u8) -> Result<(u8, u8)> {
+    let resp = exchange_feature_report(file, &build_query(tx_id, 0x00, 0x81, 0x02, &[]))
+        .context("firmware query failed")?;
+    // arguments[0] = major, arguments[1] = minor
+    Ok((resp[8], resp[9]))
+}
+
+fn query_dpi(file: &std::fs::File) -> Result<(u16, u16)> {
+    // arg[0] = VARSTORE (0x01); response returns DPI X/Y as big-endian u16 pairs.
+    let resp = exchange_feature_report(file, &build_query(0x1F, 0x04, 0x85, 0x07, &[0x01]))
+        .context("DPI query failed")?;
+    let dpi_x = u16::from_be_bytes([resp[9], resp[10]]);
+    let dpi_y = u16::from_be_bytes([resp[11], resp[12]]);
+    Ok((dpi_x, dpi_y))
 }
 
 fn find_mouse_controller() -> Option<DeviceController> {
@@ -382,11 +413,14 @@ fn main() -> Result<()> {
     let dock = DeviceController::new(DeviceSpec::mouse_dock_pro(), dock_rgb_report);
     let mouse = find_mouse_controller();
 
-    match (cli.check, cli.color, cli.battery) {
-        (true, None, false) => run_check(&dock, mouse.as_ref()),
-        (false, Some(color_name), false) => run_set_color(&dock, mouse.as_ref(), color_name),
-        (false, None, true) => run_battery(mouse.as_ref()),
-        _ => bail!("specify exactly one action: --check, --color, or --battery"),
+    match (cli.check, cli.color, cli.battery, cli.info) {
+        (true, None, false, false) => run_check(&dock, mouse.as_ref()),
+        (false, Some(color_name), false, false) => {
+            run_set_color(&dock, mouse.as_ref(), color_name)
+        }
+        (false, None, true, false) => run_battery(mouse.as_ref()),
+        (false, None, false, true) => run_info(&dock, mouse.as_ref()),
+        _ => bail!("specify exactly one action: --check, --color, --battery, or --info"),
     }
 }
 
@@ -399,6 +433,60 @@ fn run_battery(mouse: Option<&DeviceController>) -> Result<()> {
     let charging = if status.charging { " (charging)" } else { "" };
     println!("✓ Battery: {}%{}", status.percent, charging);
     Ok(())
+}
+
+fn run_info(dock: &DeviceController, mouse: Option<&DeviceController>) -> Result<()> {
+    // Dock info — queried directly with dock-range tx_id.
+    let dock_path = dock.open_hidraw_path()?;
+    let dock_file = open_hidraw(&dock_path)?;
+    println!("{}", dock.spec.name);
+    println!("  Path:     {}", dock_path.display());
+    print_field("Serial", query_serial(&dock_file, 0xFF).ok());
+    print_field("Firmware", query_firmware(&dock_file, 0xFF).ok().map(fw_str));
+
+    // Mouse info — queries forwarded by the dock over RF.
+    println!();
+    match mouse {
+        Some(ctrl) => {
+            let mouse_path = ctrl.open_hidraw_path()?;
+            let mouse_file = open_hidraw(&mouse_path)?;
+            println!("{}", ctrl.spec.name);
+            println!("  Path:     {}", mouse_path.display());
+            print_field("Serial", query_serial(&mouse_file, 0x1F).ok());
+            print_field("Firmware", query_firmware(&mouse_file, 0x1F).ok().map(fw_str));
+            match query_battery(&mouse_file) {
+                Ok(s) => {
+                    println!("  Battery:  {}%", s.percent);
+                    println!("  Charging: {}", if s.charging { "yes" } else { "no" });
+                }
+                Err(_) => println!("  Battery:  —"),
+            }
+            print_field(
+                "DPI",
+                query_dpi(&mouse_file).ok().map(|(x, y)| {
+                    if x == y {
+                        format!("{x}")
+                    } else {
+                        format!("{x} / {y}")
+                    }
+                }),
+            );
+        }
+        None => println!("Razer Basilisk V3 Pro 35K — not detected"),
+    }
+
+    Ok(())
+}
+
+fn print_field<T: std::fmt::Display>(label: &str, value: Option<T>) {
+    match value {
+        Some(v) => println!("  {:<10}{}", format!("{label}:"), v),
+        None => println!("  {:<10}—", format!("{label}:")),
+    }
+}
+
+fn fw_str((major, minor): (u8, u8)) -> String {
+    format!("{major}.{minor:02}")
 }
 
 fn run_check(dock: &DeviceController, mouse: Option<&DeviceController>) -> Result<()> {

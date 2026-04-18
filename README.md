@@ -21,6 +21,7 @@ When the mouse is connected wirelessly through the dock, razerd sends a single c
 razerd --color <COLOR>
 razerd --check
 razerd --battery
+razerd --info
 ```
 
 ### Options
@@ -30,6 +31,7 @@ razerd --battery
 | `--color red\|green\|blue\|white\|off` | Apply color to dock and mouse |
 | `--check` | Verify devices are detected and accessible |
 | `--battery` | Report mouse battery percentage and charging status |
+| `--info` | Full device report: serial, firmware, battery, DPI |
 
 ### Examples
 
@@ -37,7 +39,24 @@ razerd --battery
 razerd --check
 razerd --color blue
 razerd --battery          # → ✓ Battery: 89%  (or "89% (charging)")
+razerd --info
 razerd --color off
+```
+
+Example `--info` output:
+```
+Razer Mouse Dock Pro
+  Path:     /dev/hidraw0
+  Serial:   PM2526U28101432
+  Firmware: 2.01
+
+Razer Basilisk V3 Pro 35K (via Dock)
+  Path:     /dev/hidraw0
+  Serial:   PM2516H33301682
+  Firmware: 1.00
+  Battery:  89%
+  Charging: no
+  DPI:      1800
 ```
 
 ## Installation
