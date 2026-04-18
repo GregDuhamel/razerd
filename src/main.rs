@@ -613,7 +613,13 @@ mod tests {
 
     #[test]
     fn build_query_copies_arguments() {
-        let q = build_query(TX_ID_MOUSE, CLASS_DPI, CMD_GET_DPI, 0x07, &[0x01, 0x02, 0x03]);
+        let q = build_query(
+            TX_ID_MOUSE,
+            CLASS_DPI,
+            CMD_GET_DPI,
+            0x07,
+            &[0x01, 0x02, 0x03],
+        );
         assert_eq!(&q[8..11], &[0x01, 0x02, 0x03]);
     }
 
@@ -678,7 +684,10 @@ mod tests {
 
         cli.check = false;
         cli.color = Some(ColorName::Blue);
-        assert!(matches!(cli.action().unwrap(), Action::Color(ColorName::Blue)));
+        assert!(matches!(
+            cli.action().unwrap(),
+            Action::Color(ColorName::Blue)
+        ));
     }
 
     /// Regression test: HIDIOCSFEATURE for a 91-byte buffer must match what
