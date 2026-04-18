@@ -1,17 +1,17 @@
 .PHONY: build install uninstall clean
 
-PREFIX ?= /usr/local
+PREFIX ?= $(HOME)/.local
 BIN    := $(PREFIX)/bin/razerd
 
 build:
 	cargo build --release
 
 install: build
-	sudo install -m 0755 target/release/razerd $(BIN)
+	install -Dm 0755 target/release/razerd $(BIN)
 	@echo "✓ installed: $(BIN)"
 
 uninstall:
-	sudo rm -f $(BIN)
+	rm -f $(BIN)
 	@echo "✓ removed: $(BIN)"
 
 clean:
