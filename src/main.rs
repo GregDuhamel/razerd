@@ -104,7 +104,6 @@ impl DeviceSpec {
             name: "Razer Basilisk V3 Pro 35K (Wireless)",
         }
     }
-
 }
 
 struct DeviceController {
@@ -118,7 +117,11 @@ impl DeviceController {
     }
 
     fn check(&self) -> Result<PathBuf> {
-        let path = find_hidraw(self.spec.vendor_id, self.spec.product_id, self.spec.interface)?;
+        let path = find_hidraw(
+            self.spec.vendor_id,
+            self.spec.product_id,
+            self.spec.interface,
+        )?;
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -134,7 +137,11 @@ impl DeviceController {
     }
 
     fn set_color(&self, color: Rgb) -> Result<()> {
-        let path = find_hidraw(self.spec.vendor_id, self.spec.product_id, self.spec.interface)?;
+        let path = find_hidraw(
+            self.spec.vendor_id,
+            self.spec.product_id,
+            self.spec.interface,
+        )?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -148,7 +155,13 @@ impl DeviceController {
         let mut buf = [0u8; REPORT_LEN + 1];
         buf[1..].copy_from_slice(&report);
 
-        let ret = unsafe { libc::ioctl(file.as_raw_fd(), hidiocsfeature(buf.len()), buf.as_mut_ptr()) };
+        let ret = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                hidiocsfeature(buf.len()),
+                buf.as_mut_ptr(),
+            )
+        };
         if ret < 0 {
             bail!("HIDIOCSFEATURE failed: {}", std::io::Error::last_os_error());
         }
