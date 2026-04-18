@@ -39,12 +39,13 @@ razerd --color off
 
 ## Installation
 
-### Build
+### Build and install
 
 ```bash
-cargo build --release
-sudo cp target/release/razerd /usr/local/bin/
+make install
 ```
+
+This runs `cargo build --release` and installs the binary to `/usr/local/bin/razerd` (override with `PREFIX=...`). To remove it: `make uninstall`.
 
 ### udev rules (required to run without sudo)
 
