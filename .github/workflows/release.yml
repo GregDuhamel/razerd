@@ -55,10 +55,13 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore: release v${{ steps.version.outputs.version }}"
+          if ! git diff --quiet Cargo.toml Cargo.lock; then
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore: release v${{ steps.version.outputs.version }}"
+            git push origin main
+          fi
           git tag "v${{ steps.version.outputs.version }}"
-          git push origin main "v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
 
       - name: Rename binary
         run: cp target/release/razerd razerd-x86_64-linux
