@@ -1,38 +1,117 @@
+//! Minimal RGB daemon for the Razer Mouse Dock Pro and a wirelessly connected
+//! Razer Basilisk V3 Pro 35K.
+//!
+//! All commands go through a single hidraw interface on the dock. The dock
+//! firmware routes requests to itself or forwards them to the wireless mouse
+//! over the RF link based on the transaction id and report layout.
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use std::fs::{self, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+// ---------- USB / HID constants ----------
 
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const MOUSE_DOCK_PRO_PRODUCT_ID: u16 = 0x00A4;
-const BASILISK_V3_PRO_35K_WIRED_PRODUCT_ID: u16 = 0x00CC;
-const BASILISK_V3_PRO_35K_WIRELESS_PRODUCT_ID: u16 = 0x00CD;
+const DOCK_INTERFACE: u8 = 0;
+const HID_SYSFS_ROOT: &str = "/sys/class/hidraw";
+const DEV_ROOT: &str = "/dev";
+
+// HID bus type prefix used by the kernel in /sys/.../device/uevent's HID_ID field.
+// "0003" = USB HID.
+const HID_ID_USB_PREFIX: &str = "0003";
+
+// Razer HID feature report fixed size.
 const REPORT_LEN: usize = 90;
 
-// HIDIOC{S,G}FEATURE(len) = _IOC(_IOC_WRITE|_IOC_READ, 'H', {0x06,0x07}, len)
-fn hidiocsfeature(len: usize) -> u64 {
-    (3u64 << 30) | (b'H' as u64) << 8 | 0x06 | ((len as u64) << 16)
+// ---------- Razer protocol constants ----------
+
+// Transaction id conventions observed on this hardware:
+// * `TX_ID_DOCK_LED`/`TX_ID_DOCK`   — target the dock itself
+// * `TX_ID_MOUSE`                   — dock forwards the request over RF to the mouse
+const TX_ID_MOUSE: u8 = 0x1F;
+const TX_ID_DOCK: u8 = 0xFF;
+const TX_ID_DOCK_LED: u8 = 0xF7;
+
+const CLASS_DEVICE: u8 = 0x00;
+const CMD_GET_FIRMWARE: u8 = 0x81;
+const CMD_GET_SERIAL: u8 = 0x82;
+
+const CLASS_DPI: u8 = 0x04;
+const CMD_GET_DPI: u8 = 0x85;
+
+const CLASS_POWER: u8 = 0x07;
+const CMD_GET_BATTERY_LEVEL: u8 = 0x80;
+const CMD_GET_CHARGING: u8 = 0x84;
+
+const CLASS_EXTENDED_MATRIX: u8 = 0x0F;
+const CMD_SET_MATRIX_EFFECT: u8 = 0x03;
+
+// Dock LED ring layout.
+const DOCK_LED_DATA_SIZE: u8 = 0x1D;
+const DOCK_LED_ZONES: usize = 8;
+const DOCK_LED_COUNT_MINUS_ONE: u8 = (DOCK_LED_ZONES as u8) - 1;
+
+// Basilisk V3 Pro 35K LED layout when routed via the dock.
+const MOUSE_LED_DATA_SIZE: u8 = 0x2C;
+const MOUSE_LED_ZONES: usize = 13;
+const MOUSE_LED_COUNT_MINUS_ONE: u8 = (MOUSE_LED_ZONES as u8) - 1;
+
+// Window given to the dock to forward a request to the mouse over RF and
+// queue the reply before we read it back.
+const RESPONSE_WAIT: Duration = Duration::from_millis(50);
+
+// Linux hidraw ioctl numbers: _IOC(_IOC_WRITE|_IOC_READ, 'H', {0x06,0x07}, len)
+fn hidioc_set_feature(len: usize) -> u64 {
+    (3u64 << 30) | ((b'H' as u64) << 8) | 0x06 | ((len as u64) << 16)
 }
 
-fn hidiocgfeature(len: usize) -> u64 {
-    (3u64 << 30) | (b'H' as u64) << 8 | 0x07 | ((len as u64) << 16)
+fn hidioc_get_feature(len: usize) -> u64 {
+    (3u64 << 30) | ((b'H' as u64) << 8) | 0x07 | ((len as u64) << 16)
 }
+
+// ---------- CLI ----------
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Cli {
+    /// Verify the dock is detected and accessible.
     #[arg(long, conflicts_with_all = ["color", "battery", "info"])]
     check: bool,
 
+    /// Apply a color to the dock and the wireless mouse.
     #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info"])]
     color: Option<ColorName>,
 
+    /// Print the mouse battery level and charging status.
     #[arg(long, conflicts_with_all = ["check", "color", "info"])]
     battery: bool,
 
+    /// Print a full device report (serial, firmware, battery, DPI, ...).
     #[arg(long, conflicts_with_all = ["check", "color", "battery"])]
     info: bool,
+}
+
+enum Action {
+    Check,
+    Color(ColorName),
+    Battery,
+    Info,
+}
+
+impl Cli {
+    fn action(&self) -> Result<Action> {
+        match (self.check, self.color, self.battery, self.info) {
+            (true, None, false, false) => Ok(Action::Check),
+            (false, Some(c), false, false) => Ok(Action::Color(c)),
+            (false, None, true, false) => Ok(Action::Battery),
+            (false, None, false, true) => Ok(Action::Info),
+            _ => bail!("specify exactly one action: --check, --color, --battery, or --info"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -66,7 +145,7 @@ impl ColorName {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Rgb {
     red: u8,
     green: u8,
@@ -79,251 +158,200 @@ impl Rgb {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DeviceSpec {
-    vendor_id: u16,
-    product_id: u16,
-    interface: u8,
-    name: &'static str,
+// ---------- Hidraw device ----------
+
+/// Owned handle over a `/dev/hidraw*` node, with typed feature-report I/O.
+struct HidrawDevice {
+    file: File,
+    path: PathBuf,
 }
 
-impl DeviceSpec {
-    const fn mouse_dock_pro() -> Self {
-        Self {
-            vendor_id: RAZER_VENDOR_ID,
-            product_id: MOUSE_DOCK_PRO_PRODUCT_ID,
-            interface: 0,
-            name: "Razer Mouse Dock Pro",
-        }
-    }
-
-    const fn basilisk_v3_pro_35k_wired() -> Self {
-        Self {
-            vendor_id: RAZER_VENDOR_ID,
-            product_id: BASILISK_V3_PRO_35K_WIRED_PRODUCT_ID,
-            interface: 0,
-            name: "Razer Basilisk V3 Pro 35K (Wired)",
-        }
-    }
-
-    const fn basilisk_v3_pro_35k_wireless() -> Self {
-        Self {
-            vendor_id: RAZER_VENDOR_ID,
-            product_id: BASILISK_V3_PRO_35K_WIRELESS_PRODUCT_ID,
-            interface: 0,
-            name: "Razer Basilisk V3 Pro 35K (Wireless)",
-        }
-    }
-}
-
-struct DeviceController {
-    spec: DeviceSpec,
-    build_report: fn(Rgb) -> [u8; REPORT_LEN],
-}
-
-impl DeviceController {
-    fn new(spec: DeviceSpec, build_report: fn(Rgb) -> [u8; REPORT_LEN]) -> Self {
-        Self { spec, build_report }
-    }
-
-    fn check(&self) -> Result<PathBuf> {
-        let path = find_hidraw(
-            self.spec.vendor_id,
-            self.spec.product_id,
-            self.spec.interface,
-        )?;
-        OpenOptions::new()
+impl HidrawDevice {
+    /// Open the Mouse Dock Pro's control interface.
+    fn open_dock() -> Result<Self> {
+        let path = find_hidraw(RAZER_VENDOR_ID, MOUSE_DOCK_PRO_PRODUCT_ID, DOCK_INTERFACE)
+            .context("Razer Mouse Dock Pro not detected")?;
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
-            .with_context(|| {
-                format!(
-                    "found {} at {} but cannot open — check udev permissions",
-                    self.spec.name,
-                    path.display()
-                )
-            })?;
-        Ok(path)
+            .with_context(|| format!("cannot open {} — check udev permissions", path.display()))?;
+        Ok(Self { file, path })
     }
 
-    fn set_color(&self, color: Rgb) -> Result<()> {
-        let path = self.open_hidraw_path()?;
-        let file = open_hidraw(&path)?;
-        send_feature_report(&file, &(self.build_report)(color))
+    /// Send a 90-byte HID feature report (SET_REPORT with type=feature, id=0).
+    ///
+    /// The hidraw ioctl buffer is `[report_id, ...90 bytes...]`; the kernel
+    /// strips the report id and issues the USB control transfer.
+    fn send_feature(&self, report: &[u8; REPORT_LEN]) -> Result<()> {
+        let mut buf = [0u8; REPORT_LEN + 1];
+        buf[1..].copy_from_slice(report);
+
+        // SAFETY: `self.file` is an owned, valid fd; `buf` is a unique mutable
+        // array of exactly the byte-length we pass to the ioctl; the kernel
+        // hidraw driver accepts the call and returns either ≥0 on success or
+        // -1 on failure (with errno set).
+        let ret = unsafe {
+            libc::ioctl(
+                self.file.as_raw_fd(),
+                hidioc_set_feature(buf.len()),
+                buf.as_mut_ptr(),
+            )
+        };
+        if ret < 0 {
+            bail!("HIDIOCSFEATURE failed: {}", std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
-    fn open_hidraw_path(&self) -> Result<PathBuf> {
-        find_hidraw(
-            self.spec.vendor_id,
-            self.spec.product_id,
-            self.spec.interface,
-        )
+    /// Send a request and read back the matching 90-byte response.
+    fn exchange_feature(&self, request: &[u8; REPORT_LEN]) -> Result<[u8; REPORT_LEN]> {
+        self.send_feature(request)?;
+        std::thread::sleep(RESPONSE_WAIT);
+
+        let mut buf = [0u8; REPORT_LEN + 1];
+
+        // SAFETY: same invariants as `send_feature`; `HIDIOCGFEATURE` writes at
+        // most `buf.len()` bytes into `buf`.
+        let ret = unsafe {
+            libc::ioctl(
+                self.file.as_raw_fd(),
+                hidioc_get_feature(buf.len()),
+                buf.as_mut_ptr(),
+            )
+        };
+        if ret < 0 {
+            bail!("HIDIOCGFEATURE failed: {}", std::io::Error::last_os_error());
+        }
+
+        let mut response = [0u8; REPORT_LEN];
+        response.copy_from_slice(&buf[1..]);
+        Ok(response)
     }
 }
 
-fn open_hidraw(path: &Path) -> Result<std::fs::File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("cannot open {} — check udev permissions", path.display()))
-}
+// ---------- Hidraw discovery ----------
 
-// HIDIOCSFEATURE expects [report_id=0x00, ...90 bytes...] = 91 bytes total.
-// The kernel strips report_id and issues USB SET_REPORT(feature, id=0) with our 90 bytes.
-fn send_feature_report(file: &std::fs::File, report: &[u8; REPORT_LEN]) -> Result<()> {
-    let mut buf = [0u8; REPORT_LEN + 1];
-    buf[1..].copy_from_slice(report);
-    let ret = unsafe {
-        libc::ioctl(
-            file.as_raw_fd(),
-            hidiocsfeature(buf.len()),
-            buf.as_mut_ptr(),
-        )
-    };
-    if ret < 0 {
-        bail!("HIDIOCSFEATURE failed: {}", std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-// Symmetric to send_feature_report: writes request, reads the 90-byte response back.
-fn exchange_feature_report(
-    file: &std::fs::File,
-    request: &[u8; REPORT_LEN],
-) -> Result<[u8; REPORT_LEN]> {
-    send_feature_report(file, request)?;
-    // Let the dock forward the request over RF and queue the mouse's reply.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    let mut buf = [0u8; REPORT_LEN + 1];
-    let ret = unsafe {
-        libc::ioctl(
-            file.as_raw_fd(),
-            hidiocgfeature(buf.len()),
-            buf.as_mut_ptr(),
-        )
-    };
-    if ret < 0 {
-        bail!("HIDIOCGFEATURE failed: {}", std::io::Error::last_os_error());
-    }
-
-    let mut response = [0u8; REPORT_LEN];
-    response.copy_from_slice(&buf[1..]);
-    Ok(response)
-}
-
-// Locate /dev/hidrawN for the given USB vendor/product/interface via sysfs.
+/// Resolve `/dev/hidrawN` for the given USB vendor/product/interface by
+/// walking `/sys/class/hidraw`.
 fn find_hidraw(vendor_id: u16, product_id: u16, interface: u8) -> Result<PathBuf> {
-    // HID_ID format in uevent: "0003:VVVVVVVV:PPPPPPPP" (uppercase hex, zero-padded to 8 digits)
-    let hid_id = format!("0003:{vendor_id:08X}:{product_id:08X}");
+    let hid_id = format!("{HID_ID_USB_PREFIX}:{vendor_id:08X}:{product_id:08X}");
 
-    let mut entries: Vec<_> = fs::read_dir("/sys/class/hidraw")
-        .context("cannot read /sys/class/hidraw")?
-        .filter_map(|e| e.ok())
-        .collect();
+    let mut entries: Vec<_> = std::fs::read_dir(HID_SYSFS_ROOT)
+        .with_context(|| format!("cannot read {HID_SYSFS_ROOT}"))?
+        .collect::<std::io::Result<_>>()
+        .with_context(|| format!("cannot enumerate {HID_SYSFS_ROOT}"))?;
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
-        let uevent = entry.path().join("device/uevent");
-        let Ok(content) = fs::read_to_string(&uevent) else {
+        let uevent_path = entry.path().join("device/uevent");
+        let Ok(uevent) = std::fs::read_to_string(&uevent_path) else {
             continue;
         };
-        if !content.contains(&hid_id) {
+        if !uevent.contains(&hid_id) {
             continue;
         }
 
-        // The symlink /sys/class/hidraw/hidrawN/device resolves to the HID device node.
-        // Its parent is the USB interface dir, named like "3-2:1.N" where N = interface number.
-        let canonical = match fs::canonicalize(entry.path().join("device")) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let usb_iface = match fs::canonicalize(canonical.join("..")) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let iface_num: u8 = usb_iface
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|s| s.split('.').next_back())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(255);
-
-        if iface_num == interface {
-            return Ok(Path::new("/dev").join(entry.file_name()));
+        if hidraw_interface_number(&entry.path()) == Some(interface) {
+            return Ok(Path::new(DEV_ROOT).join(entry.file_name()));
         }
     }
 
     bail!(
-        "{} not found (no hidraw for {:04x}:{:04x} interface {})",
-        "device",
+        "no hidraw for {:04x}:{:04x} interface {} — device not connected?",
         vendor_id,
         product_id,
         interface
     )
 }
 
+/// Extract the USB interface number from the hidraw's sysfs symlink.
+///
+/// The `device` symlink resolves to the HID device node; its parent is the
+/// USB interface directory named like `3-2:1.N` where `N` is the interface
+/// number.
+fn hidraw_interface_number(hidraw_sysfs_path: &Path) -> Option<u8> {
+    let canonical = std::fs::canonicalize(hidraw_sysfs_path.join("device")).ok()?;
+    let usb_iface = std::fs::canonicalize(canonical.join("..")).ok()?;
+    usb_iface
+        .file_name()?
+        .to_str()?
+        .rsplit_once('.')?
+        .1
+        .parse()
+        .ok()
+}
+
+// ---------- Protocol: report builders ----------
+
+/// XOR of bytes 2..=87, the Razer HID report checksum.
+fn compute_crc(bytes: &[u8; REPORT_LEN]) -> u8 {
+    bytes[2..88].iter().fold(0u8, |acc, b| acc ^ b)
+}
+
+/// Populate the common fixed-size header used by all LED matrix reports and
+/// return the byte index at which the per-LED RGB triplets begin.
+fn write_matrix_header(
+    bytes: &mut [u8; REPORT_LEN],
+    tx_id: u8,
+    data_size: u8,
+    led_count_minus_one: u8,
+) -> usize {
+    bytes[1] = tx_id;
+    bytes[5] = data_size;
+    bytes[6] = CLASS_EXTENDED_MATRIX;
+    bytes[7] = CMD_SET_MATRIX_EFFECT;
+    bytes[12] = led_count_minus_one;
+    13
+}
+
+fn fill_leds(bytes: &mut [u8; REPORT_LEN], start: usize, zones: usize, color: Rgb) {
+    for i in 0..zones {
+        let o = start + i * 3;
+        bytes[o] = color.red;
+        bytes[o + 1] = color.green;
+        bytes[o + 2] = color.blue;
+    }
+}
+
+/// Build the dock's own 8-LED ring command.
 fn dock_rgb_report(color: Rgb) -> [u8; REPORT_LEN] {
     let mut bytes = [0u8; REPORT_LEN];
-
-    bytes[0] = 0x00;
-    bytes[1] = 0xF7;
-    bytes[5] = 0x1D;
-    bytes[6] = 0x0F;
-    bytes[7] = 0x03;
-    bytes[12] = 0x07;
-
-    for led_index in 0..8 {
-        let offset = 13 + (led_index * 3);
-        bytes[offset] = color.red;
-        bytes[offset + 1] = color.green;
-        bytes[offset + 2] = color.blue;
-    }
-
+    let start = write_matrix_header(
+        &mut bytes,
+        TX_ID_DOCK_LED,
+        DOCK_LED_DATA_SIZE,
+        DOCK_LED_COUNT_MINUS_ONE,
+    );
+    fill_leds(&mut bytes, start, DOCK_LED_ZONES, color);
     bytes[88] = compute_crc(&bytes);
-    bytes[89] = 0x00;
-
     bytes
 }
 
-// Basilisk V3 Pro 35K LED report via Mouse Dock Pro RF link.
-// Reverse-engineered from Razer Synapse USB capture (Windows):
-// - Same command class/id as dock (0x0F/0x03) but data_size=0x2C, 13 LED zones
-// - Dock firmware routes ds=0x1D to dock ring, ds=0x2C to connected wireless mouse
+/// Build the Basilisk V3 Pro 35K 13-zone command. When sent to the dock's
+/// hidraw, the firmware forwards it to the mouse over the RF link.
 fn mouse_via_dock_rgb_report(color: Rgb) -> [u8; REPORT_LEN] {
     let mut bytes = [0u8; REPORT_LEN];
-
-    bytes[0] = 0x00; // status
-    bytes[1] = 0x1F; // transaction_id (any value < 0xF7 targets the mouse)
-    bytes[5] = 0x2C; // data_size = 44
-    bytes[6] = 0x0F; // command_class
-    bytes[7] = 0x03; // command_id
-    bytes[12] = 0x0C; // LED_COUNT - 1 = 12 (13 zones on the Basilisk)
-
-    for led_index in 0..13 {
-        let offset = 13 + led_index * 3;
-        bytes[offset] = color.red;
-        bytes[offset + 1] = color.green;
-        bytes[offset + 2] = color.blue;
-    }
-
+    let start = write_matrix_header(
+        &mut bytes,
+        TX_ID_MOUSE,
+        MOUSE_LED_DATA_SIZE,
+        MOUSE_LED_COUNT_MINUS_ONE,
+    );
+    fill_leds(&mut bytes, start, MOUSE_LED_ZONES, color);
     bytes[88] = compute_crc(&bytes);
-    bytes[89] = 0x00;
-
     bytes
 }
 
-fn compute_crc(bytes: &[u8; REPORT_LEN]) -> u8 {
-    bytes[2..88].iter().fold(0u8, |acc, byte| acc ^ byte)
-}
+// ---------- Protocol: query helpers ----------
 
-// Razer HID query (SET_REPORT + GET_REPORT):
-//   byte[1] = tx_id, byte[5] = data_size, byte[6] = class, byte[7] = cmd,
-//   byte[8..8+args.len()] = request arguments, byte[88] = XOR CRC.
-// Mouse-targeted queries use tx_id in the mouse range (< 0xF7); dock-targeted use 0xFF.
+/// Build a query report: `[_, tx_id, 0, 0, 0, data_size, class, cmd, args..., _, crc, _]`.
 fn build_query(tx_id: u8, class: u8, cmd: u8, data_size: u8, args: &[u8]) -> [u8; REPORT_LEN] {
+    assert!(
+        8 + args.len() <= 88,
+        "query arguments overflow the report body"
+    );
+
     let mut bytes = [0u8; REPORT_LEN];
     bytes[1] = tx_id;
     bytes[5] = data_size;
@@ -334,146 +362,171 @@ fn build_query(tx_id: u8, class: u8, cmd: u8, data_size: u8, args: &[u8]) -> [u8
     bytes
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BatteryStatus {
     percent: u8,
     charging: bool,
 }
 
-fn query_battery(file: &std::fs::File) -> Result<BatteryStatus> {
-    let level_resp = exchange_feature_report(file, &build_query(0x1F, 0x07, 0x80, 0x02, &[]))
+fn query_battery(dock: &HidrawDevice) -> Result<BatteryStatus> {
+    let level = dock
+        .exchange_feature(&build_query(
+            TX_ID_MOUSE,
+            CLASS_POWER,
+            CMD_GET_BATTERY_LEVEL,
+            0x02,
+            &[],
+        ))
         .context("battery level query failed")?;
-    let charge_resp = exchange_feature_report(file, &build_query(0x1F, 0x07, 0x84, 0x02, &[]))
+    let charge = dock
+        .exchange_feature(&build_query(
+            TX_ID_MOUSE,
+            CLASS_POWER,
+            CMD_GET_CHARGING,
+            0x02,
+            &[],
+        ))
         .context("charging status query failed")?;
 
-    // Response arguments[1] = byte[9]: 0-255 for level, 0/1 for charging.
-    let percent = ((level_resp[9] as u32 * 100) / 255) as u8;
-    let charging = charge_resp[9] != 0;
-
-    Ok(BatteryStatus { percent, charging })
+    Ok(BatteryStatus {
+        percent: parse_battery_percent(level[9]),
+        charging: charge[9] != 0,
+    })
 }
 
-fn query_serial(file: &std::fs::File, tx_id: u8) -> Result<String> {
-    let resp = exchange_feature_report(file, &build_query(tx_id, 0x00, 0x82, 0x16, &[]))
+/// Razer reports battery as 0..=255; scale to 0..=100 saturating.
+fn parse_battery_percent(raw: u8) -> u8 {
+    ((raw as u32 * 100) / 255) as u8
+}
+
+fn query_serial(dock: &HidrawDevice, tx_id: u8) -> Result<String> {
+    let resp = dock
+        .exchange_feature(&build_query(tx_id, CLASS_DEVICE, CMD_GET_SERIAL, 0x16, &[]))
         .context("serial query failed")?;
-    // Serial is an ASCII string in arguments[0..22] = bytes[8..30], zero-terminated.
-    let raw = &resp[8..30];
+    Ok(parse_serial(&resp))
+}
+
+/// Serial is an ASCII string in the 22-byte argument block, zero-terminated.
+fn parse_serial(response: &[u8; REPORT_LEN]) -> String {
+    let raw = &response[8..30];
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    Ok(String::from_utf8_lossy(&raw[..end]).trim().to_string())
+    String::from_utf8_lossy(&raw[..end]).trim().to_string()
 }
 
-fn query_firmware(file: &std::fs::File, tx_id: u8) -> Result<(u8, u8)> {
-    let resp = exchange_feature_report(file, &build_query(tx_id, 0x00, 0x81, 0x02, &[]))
+fn query_firmware(dock: &HidrawDevice, tx_id: u8) -> Result<FirmwareVersion> {
+    let resp = dock
+        .exchange_feature(&build_query(
+            tx_id,
+            CLASS_DEVICE,
+            CMD_GET_FIRMWARE,
+            0x02,
+            &[],
+        ))
         .context("firmware query failed")?;
-    // arguments[0] = major, arguments[1] = minor
-    Ok((resp[8], resp[9]))
+    Ok(FirmwareVersion {
+        major: resp[8],
+        minor: resp[9],
+    })
 }
 
-fn query_dpi(file: &std::fs::File) -> Result<(u16, u16)> {
-    // arg[0] = VARSTORE (0x01); response returns DPI X/Y as big-endian u16 pairs.
-    let resp = exchange_feature_report(file, &build_query(0x1F, 0x04, 0x85, 0x07, &[0x01]))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FirmwareVersion {
+    major: u8,
+    minor: u8,
+}
+
+impl std::fmt::Display for FirmwareVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{:02}", self.major, self.minor)
+    }
+}
+
+fn query_dpi(dock: &HidrawDevice) -> Result<(u16, u16)> {
+    // arg[0] = VARSTORE (0x01); response carries DPI X/Y as big-endian u16 pairs.
+    let resp = dock
+        .exchange_feature(&build_query(
+            TX_ID_MOUSE,
+            CLASS_DPI,
+            CMD_GET_DPI,
+            0x07,
+            &[0x01],
+        ))
         .context("DPI query failed")?;
-    let dpi_x = u16::from_be_bytes([resp[9], resp[10]]);
-    let dpi_y = u16::from_be_bytes([resp[11], resp[12]]);
-    Ok((dpi_x, dpi_y))
+    Ok((
+        u16::from_be_bytes([resp[9], resp[10]]),
+        u16::from_be_bytes([resp[11], resp[12]]),
+    ))
 }
 
-fn find_mouse_controller() -> Option<DeviceController> {
-    // Direct USB (wired or dedicated wireless dongle)
-    let direct = [
-        DeviceSpec::basilisk_v3_pro_35k_wired(),
-        DeviceSpec::basilisk_v3_pro_35k_wireless(),
-    ];
-    if let Some(spec) = direct
-        .into_iter()
-        .find(|s| find_hidraw(s.vendor_id, s.product_id, s.interface).is_ok())
-    {
-        return Some(DeviceController::new(spec, mouse_via_dock_rgb_report));
-    }
-
-    // Wireless via Mouse Dock Pro — mouse doesn't enumerate as its own USB device.
-    // Commands go to dock hidraw0 (interface 0) with ds=0x2C format; dock routes to mouse via RF.
-    if find_hidraw(RAZER_VENDOR_ID, MOUSE_DOCK_PRO_PRODUCT_ID, 0).is_ok() {
-        return Some(DeviceController::new(
-            DeviceSpec {
-                vendor_id: RAZER_VENDOR_ID,
-                product_id: MOUSE_DOCK_PRO_PRODUCT_ID,
-                interface: 0,
-                name: "Razer Basilisk V3 Pro 35K (via Dock)",
-            },
-            mouse_via_dock_rgb_report,
-        ));
-    }
-
-    None
-}
+// ---------- Actions ----------
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let dock = DeviceController::new(DeviceSpec::mouse_dock_pro(), dock_rgb_report);
-    let mouse = find_mouse_controller();
+    let action = cli.action()?;
+    let dock = HidrawDevice::open_dock()?;
 
-    match (cli.check, cli.color, cli.battery, cli.info) {
-        (true, None, false, false) => run_check(&dock, mouse.as_ref()),
-        (false, Some(color_name), false, false) => {
-            run_set_color(&dock, mouse.as_ref(), color_name)
-        }
-        (false, None, true, false) => run_battery(mouse.as_ref()),
-        (false, None, false, true) => run_info(&dock, mouse.as_ref()),
-        _ => bail!("specify exactly one action: --check, --color, --battery, or --info"),
+    match action {
+        Action::Check => run_check(&dock),
+        Action::Color(c) => run_color(&dock, c),
+        Action::Battery => run_battery(&dock),
+        Action::Info => run_info(&dock),
     }
 }
 
-fn run_battery(mouse: Option<&DeviceController>) -> Result<()> {
-    let ctrl = mouse.context("mouse not detected — battery query requires the Basilisk")?;
-    let path = ctrl.open_hidraw_path()?;
-    let file = open_hidraw(&path)?;
-    let status = query_battery(&file)?;
-
-    let charging = if status.charging { " (charging)" } else { "" };
-    println!("✓ Battery: {}%{}", status.percent, charging);
+fn run_check(dock: &HidrawDevice) -> Result<()> {
+    println!(
+        "✓ Razer Mouse Dock Pro ({}) accessible",
+        dock.path.display()
+    );
+    match query_battery(dock) {
+        Ok(_) => println!("✓ Razer Basilisk V3 Pro 35K (via Dock) responding over RF"),
+        Err(_) => println!("⚠ Mouse not responding — is it paired and awake?"),
+    }
     Ok(())
 }
 
-fn run_info(dock: &DeviceController, mouse: Option<&DeviceController>) -> Result<()> {
-    // Dock info — queried directly with dock-range tx_id.
-    let dock_path = dock.open_hidraw_path()?;
-    let dock_file = open_hidraw(&dock_path)?;
-    println!("{}", dock.spec.name);
-    println!("  Path:     {}", dock_path.display());
-    print_field("Serial", query_serial(&dock_file, 0xFF).ok());
-    print_field("Firmware", query_firmware(&dock_file, 0xFF).ok().map(fw_str));
+fn run_color(dock: &HidrawDevice, color: ColorName) -> Result<()> {
+    let label = color.as_str();
 
-    // Mouse info — queries forwarded by the dock over RF.
+    dock.send_feature(&dock_rgb_report(color.rgb()))
+        .with_context(|| format!("failed to set dock color '{label}'"))?;
+    println!("✓ Dock: {label}");
+
+    // Sent through the dock; if the mouse is not paired, the dock drops it silently.
+    dock.send_feature(&mouse_via_dock_rgb_report(color.rgb()))
+        .with_context(|| format!("failed to set mouse color '{label}'"))?;
+    println!("✓ Mouse: {label}");
+
+    Ok(())
+}
+
+fn run_battery(dock: &HidrawDevice) -> Result<()> {
+    let status = query_battery(dock)?;
+    let suffix = if status.charging { " (charging)" } else { "" };
+    println!("✓ Battery: {}%{}", status.percent, suffix);
+    Ok(())
+}
+
+fn run_info(dock: &HidrawDevice) -> Result<()> {
+    println!("Razer Mouse Dock Pro");
+    println!("  Path:     {}", dock.path.display());
+    print_field("Serial", query_serial(dock, TX_ID_DOCK).ok());
+    print_field("Firmware", query_firmware(dock, TX_ID_DOCK).ok());
+
     println!();
-    match mouse {
-        Some(ctrl) => {
-            let mouse_path = ctrl.open_hidraw_path()?;
-            let mouse_file = open_hidraw(&mouse_path)?;
-            println!("{}", ctrl.spec.name);
-            println!("  Path:     {}", mouse_path.display());
-            print_field("Serial", query_serial(&mouse_file, 0x1F).ok());
-            print_field("Firmware", query_firmware(&mouse_file, 0x1F).ok().map(fw_str));
-            match query_battery(&mouse_file) {
-                Ok(s) => {
-                    println!("  Battery:  {}%", s.percent);
-                    println!("  Charging: {}", if s.charging { "yes" } else { "no" });
-                }
-                Err(_) => println!("  Battery:  —"),
-            }
-            print_field(
-                "DPI",
-                query_dpi(&mouse_file).ok().map(|(x, y)| {
-                    if x == y {
-                        format!("{x}")
-                    } else {
-                        format!("{x} / {y}")
-                    }
-                }),
-            );
+    println!("Razer Basilisk V3 Pro 35K (via Dock)");
+    println!("  Path:     {}", dock.path.display());
+    print_field("Serial", query_serial(dock, TX_ID_MOUSE).ok());
+    print_field("Firmware", query_firmware(dock, TX_ID_MOUSE).ok());
+
+    match query_battery(dock) {
+        Ok(s) => {
+            println!("  Battery:  {}%", s.percent);
+            println!("  Charging: {}", if s.charging { "yes" } else { "no" });
         }
-        None => println!("Razer Basilisk V3 Pro 35K — not detected"),
+        Err(_) => println!("  Battery:  —"),
     }
+    print_field("DPI", query_dpi(dock).ok().map(format_dpi));
 
     Ok(())
 }
@@ -485,47 +538,154 @@ fn print_field<T: std::fmt::Display>(label: &str, value: Option<T>) {
     }
 }
 
-fn fw_str((major, minor): (u8, u8)) -> String {
-    format!("{major}.{minor:02}")
+fn format_dpi((x, y): (u16, u16)) -> String {
+    if x == y {
+        format!("{x}")
+    } else {
+        format!("{x} / {y}")
+    }
 }
 
-fn run_check(dock: &DeviceController, mouse: Option<&DeviceController>) -> Result<()> {
-    match dock.check() {
-        Ok(path) => println!("✓ {} ({}) accessible", dock.spec.name, path.display()),
-        Err(e) => println!("✗ {}: {e}", dock.spec.name),
+// ---------- Tests ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crc_xors_body_only() {
+        let mut bytes = [0u8; REPORT_LEN];
+        bytes[0] = 0xAB; // outside the XOR range, ignored
+        bytes[1] = 0xCD; // outside the XOR range, ignored
+        bytes[2] = 0x12;
+        bytes[5] = 0x34;
+        bytes[87] = 0x56;
+        bytes[88] = 0xFF; // outside the XOR range, ignored
+        bytes[89] = 0xEE; // outside the XOR range, ignored
+        assert_eq!(compute_crc(&bytes), 0x12 ^ 0x34 ^ 0x56);
     }
 
-    match mouse {
-        Some(ctrl) => match ctrl.check() {
-            Ok(path) => println!("✓ {} ({}) accessible", ctrl.spec.name, path.display()),
-            Err(e) => println!("✗ {}: {e}", ctrl.spec.name),
-        },
-        None => println!("✗ Razer Basilisk V3 Pro 35K not detected"),
-    }
-
-    Ok(())
-}
-
-fn run_set_color(
-    dock: &DeviceController,
-    mouse: Option<&DeviceController>,
-    color_name: ColorName,
-) -> Result<()> {
-    let color = color_name.rgb();
-    let s = color_name.as_str();
-
-    dock.set_color(color)
-        .with_context(|| format!("failed to set dock color '{s}'"))?;
-    println!("✓ Dock: {s}");
-
-    match mouse {
-        Some(ctrl) => {
-            ctrl.set_color(color)
-                .with_context(|| format!("failed to set mouse color '{s}'"))?;
-            println!("✓ Mouse: {s}");
+    /// Matches the dock LED command captured live from Razer Synapse on
+    /// Windows: red (0xC0, 0x00, 0x00) produces CRC 0x16.
+    #[test]
+    fn dock_rgb_report_matches_wireshark_capture() {
+        let bytes = dock_rgb_report(Rgb::new(0xC0, 0x00, 0x00));
+        let expected_prefix = [
+            0x00, 0xF7, 0x00, 0x00, 0x00, 0x1D, 0x0F, 0x03, 0x00, 0x00, 0x00, 0x00, 0x07,
+        ];
+        assert_eq!(&bytes[..expected_prefix.len()], &expected_prefix);
+        for i in 0..DOCK_LED_ZONES {
+            assert_eq!(bytes[13 + i * 3], 0xC0);
+            assert_eq!(bytes[14 + i * 3], 0x00);
+            assert_eq!(bytes[15 + i * 3], 0x00);
         }
-        None => println!("⚠ Mouse not detected — skipped"),
+        assert_eq!(bytes[88], 0x16);
+        assert_eq!(bytes[89], 0x00);
     }
 
-    Ok(())
+    #[test]
+    fn mouse_via_dock_rgb_report_structure() {
+        let bytes = mouse_via_dock_rgb_report(Rgb::new(0x00, 0x00, 0xC0));
+        assert_eq!(bytes[1], TX_ID_MOUSE);
+        assert_eq!(bytes[5], MOUSE_LED_DATA_SIZE);
+        assert_eq!(bytes[6], CLASS_EXTENDED_MATRIX);
+        assert_eq!(bytes[7], CMD_SET_MATRIX_EFFECT);
+        assert_eq!(bytes[12], MOUSE_LED_COUNT_MINUS_ONE);
+        for i in 0..MOUSE_LED_ZONES {
+            assert_eq!(bytes[13 + i * 3], 0x00);
+            assert_eq!(bytes[14 + i * 3], 0x00);
+            assert_eq!(bytes[15 + i * 3], 0xC0);
+        }
+        // Zones past MOUSE_LED_ZONES must remain zero.
+        assert_eq!(bytes[13 + MOUSE_LED_ZONES * 3], 0x00);
+        assert_eq!(bytes[88], compute_crc(&bytes));
+    }
+
+    #[test]
+    fn build_query_places_fields_correctly() {
+        let q = build_query(TX_ID_MOUSE, CLASS_POWER, CMD_GET_BATTERY_LEVEL, 0x02, &[]);
+        assert_eq!(q[1], TX_ID_MOUSE);
+        assert_eq!(q[5], 0x02);
+        assert_eq!(q[6], CLASS_POWER);
+        assert_eq!(q[7], CMD_GET_BATTERY_LEVEL);
+        assert_eq!(q[88], compute_crc(&q));
+    }
+
+    #[test]
+    fn build_query_copies_arguments() {
+        let q = build_query(TX_ID_MOUSE, CLASS_DPI, CMD_GET_DPI, 0x07, &[0x01, 0x02, 0x03]);
+        assert_eq!(&q[8..11], &[0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn color_name_rgb_table() {
+        assert_eq!(ColorName::Red.rgb(), Rgb::new(0xC0, 0x00, 0x00));
+        assert_eq!(ColorName::Green.rgb(), Rgb::new(0x00, 0xC0, 0x00));
+        assert_eq!(ColorName::Blue.rgb(), Rgb::new(0x00, 0x00, 0xC0));
+        assert_eq!(ColorName::White.rgb(), Rgb::new(0xFF, 0xFF, 0xFF));
+        assert_eq!(ColorName::Off.rgb(), Rgb::new(0x00, 0x00, 0x00));
+    }
+
+    #[test]
+    fn battery_percent_scales_0_255_to_0_100() {
+        assert_eq!(parse_battery_percent(0), 0);
+        assert_eq!(parse_battery_percent(255), 100);
+        assert_eq!(parse_battery_percent(127), 49); // integer truncation
+    }
+
+    #[test]
+    fn parse_serial_strips_trailing_zeros_and_whitespace() {
+        let mut resp = [0u8; REPORT_LEN];
+        let serial = b"PM2516H33301682";
+        resp[8..8 + serial.len()].copy_from_slice(serial);
+        // bytes past `serial.len()` stay zero, simulating a zero-terminated C string.
+        assert_eq!(parse_serial(&resp), "PM2516H33301682");
+    }
+
+    #[test]
+    fn parse_serial_handles_non_ascii_gracefully() {
+        let mut resp = [0u8; REPORT_LEN];
+        resp[8] = 0xFF; // invalid UTF-8 start byte
+        resp[9] = b'A';
+        // Should not panic; lossy conversion replaces invalid bytes.
+        let _ = parse_serial(&resp);
+    }
+
+    #[test]
+    fn firmware_version_formats_with_zero_padded_minor() {
+        let fw = FirmwareVersion { major: 2, minor: 1 };
+        assert_eq!(fw.to_string(), "2.01");
+    }
+
+    #[test]
+    fn format_dpi_collapses_identical_axes() {
+        assert_eq!(format_dpi((1800, 1800)), "1800");
+        assert_eq!(format_dpi((1600, 800)), "1600 / 800");
+    }
+
+    #[test]
+    fn cli_action_requires_exactly_one_flag() {
+        let mut cli = Cli {
+            check: false,
+            color: None,
+            battery: false,
+            info: false,
+        };
+        assert!(cli.action().is_err());
+
+        cli.check = true;
+        assert!(matches!(cli.action().unwrap(), Action::Check));
+
+        cli.check = false;
+        cli.color = Some(ColorName::Blue);
+        assert!(matches!(cli.action().unwrap(), Action::Color(ColorName::Blue)));
+    }
+
+    /// Regression test: HIDIOCSFEATURE for a 91-byte buffer must match what
+    /// the Linux kernel expects (`_IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, 91)`).
+    #[test]
+    fn hidioc_codes_match_kernel_encoding() {
+        assert_eq!(hidioc_set_feature(91), 0xC05B_4806);
+        assert_eq!(hidioc_get_feature(91), 0xC05B_4807);
+    }
 }
