@@ -1,18 +1,25 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: Build release binary
+  release:
+    name: Build and release
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute version (YYYY.MM.DD)
+        id: version
+        run: echo "version=$(date -u +'%Y.%m.%d')" >> $GITHUB_OUTPUT
+
+      - name: Update Cargo.toml version
+        run: sed -i 's/^version = .*/version = "${{ steps.version.outputs.version }}"/' Cargo.toml
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -21,7 +28,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: cargo build --release
-        run: cargo build --locked --release
+        run: cargo build --release
+
+      - name: Commit version bump and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: release v${{ steps.version.outputs.version }}"
+          git tag "v${{ steps.version.outputs.version }}"
+          git push origin main "v${{ steps.version.outputs.version }}"
 
       - name: Rename binary
         run: cp target/release/razerd razerd-x86_64-linux
@@ -29,5 +45,6 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
           files: razerd-x86_64-linux
           generate_release_notes: true
