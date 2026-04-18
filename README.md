@@ -20,6 +20,7 @@ When the mouse is connected wirelessly through the dock, razerd sends a single c
 ```
 razerd --color <COLOR>
 razerd --check
+razerd --battery
 ```
 
 ### Options
@@ -28,12 +29,14 @@ razerd --check
 |---|---|
 | `--color red\|green\|blue\|white\|off` | Apply color to dock and mouse |
 | `--check` | Verify devices are detected and accessible |
+| `--battery` | Report mouse battery percentage and charging status |
 
 ### Examples
 
 ```bash
 razerd --check
 razerd --color blue
+razerd --battery          # → ✓ Battery: 89%  (or "89% (charging)")
 razerd --color off
 ```
 
@@ -100,6 +103,8 @@ The Razer Mouse Dock Pro (`1532:00A4`) exposes three HID interfaces on USB. All 
 |---|---|---|---|
 | `0x1D` (29) | `0x07` | 8 | Dock LED ring |
 | `0x2C` (44) | `0x0C` | 13 | Basilisk V3 Pro 35K via RF |
+
+Battery queries use command class `0x07` (power): `cmd=0x80` for level, `cmd=0x84` for charging status. The dock forwards the request over RF and the mouse's reply is read back with `HIDIOCGFEATURE`.
 
 The protocol was reverse-engineered from USB captures of Razer Synapse on Windows using Wireshark.
 

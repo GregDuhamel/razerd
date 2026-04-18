@@ -10,19 +10,26 @@ const BASILISK_V3_PRO_35K_WIRED_PRODUCT_ID: u16 = 0x00CC;
 const BASILISK_V3_PRO_35K_WIRELESS_PRODUCT_ID: u16 = 0x00CD;
 const REPORT_LEN: usize = 90;
 
-// HIDIOCSFEATURE(len) = _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, len)
+// HIDIOC{S,G}FEATURE(len) = _IOC(_IOC_WRITE|_IOC_READ, 'H', {0x06,0x07}, len)
 fn hidiocsfeature(len: usize) -> u64 {
     (3u64 << 30) | (b'H' as u64) << 8 | 0x06 | ((len as u64) << 16)
+}
+
+fn hidiocgfeature(len: usize) -> u64 {
+    (3u64 << 30) | (b'H' as u64) << 8 | 0x07 | ((len as u64) << 16)
 }
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Cli {
-    #[arg(long, conflicts_with = "color")]
+    #[arg(long, conflicts_with_all = ["color", "battery"])]
     check: bool,
 
-    #[arg(long, value_enum, conflicts_with = "check")]
+    #[arg(long, value_enum, conflicts_with_all = ["check", "battery"])]
     color: Option<ColorName>,
+
+    #[arg(long, conflicts_with_all = ["check", "color"])]
+    battery: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -137,37 +144,70 @@ impl DeviceController {
     }
 
     fn set_color(&self, color: Rgb) -> Result<()> {
-        let path = find_hidraw(
+        let path = self.open_hidraw_path()?;
+        let file = open_hidraw(&path)?;
+        send_feature_report(&file, &(self.build_report)(color))
+    }
+
+    fn open_hidraw_path(&self) -> Result<PathBuf> {
+        find_hidraw(
             self.spec.vendor_id,
             self.spec.product_id,
             self.spec.interface,
-        )?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("cannot open {} — check udev permissions", path.display()))?;
-
-        let report = (self.build_report)(color);
-
-        // HIDIOCSFEATURE expects [report_id=0x00, ...report data (90 bytes)...] = 91 bytes total.
-        // The kernel strips report_id and issues USB SET_REPORT(feature, id=0) with our 90 bytes.
-        let mut buf = [0u8; REPORT_LEN + 1];
-        buf[1..].copy_from_slice(&report);
-
-        let ret = unsafe {
-            libc::ioctl(
-                file.as_raw_fd(),
-                hidiocsfeature(buf.len()),
-                buf.as_mut_ptr(),
-            )
-        };
-        if ret < 0 {
-            bail!("HIDIOCSFEATURE failed: {}", std::io::Error::last_os_error());
-        }
-
-        Ok(())
+        )
     }
+}
+
+fn open_hidraw(path: &Path) -> Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("cannot open {} — check udev permissions", path.display()))
+}
+
+// HIDIOCSFEATURE expects [report_id=0x00, ...90 bytes...] = 91 bytes total.
+// The kernel strips report_id and issues USB SET_REPORT(feature, id=0) with our 90 bytes.
+fn send_feature_report(file: &std::fs::File, report: &[u8; REPORT_LEN]) -> Result<()> {
+    let mut buf = [0u8; REPORT_LEN + 1];
+    buf[1..].copy_from_slice(report);
+    let ret = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            hidiocsfeature(buf.len()),
+            buf.as_mut_ptr(),
+        )
+    };
+    if ret < 0 {
+        bail!("HIDIOCSFEATURE failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+// Symmetric to send_feature_report: writes request, reads the 90-byte response back.
+fn exchange_feature_report(
+    file: &std::fs::File,
+    request: &[u8; REPORT_LEN],
+) -> Result<[u8; REPORT_LEN]> {
+    send_feature_report(file, request)?;
+    // Let the dock forward the request over RF and queue the mouse's reply.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let mut buf = [0u8; REPORT_LEN + 1];
+    let ret = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            hidiocgfeature(buf.len()),
+            buf.as_mut_ptr(),
+        )
+    };
+    if ret < 0 {
+        bail!("HIDIOCGFEATURE failed: {}", std::io::Error::last_os_error());
+    }
+
+    let mut response = [0u8; REPORT_LEN];
+    response.copy_from_slice(&buf[1..]);
+    Ok(response)
 }
 
 // Locate /dev/hidrawN for the given USB vendor/product/interface via sysfs.
@@ -276,6 +316,37 @@ fn compute_crc(bytes: &[u8; REPORT_LEN]) -> u8 {
     bytes[2..88].iter().fold(0u8, |acc, byte| acc ^ byte)
 }
 
+#[derive(Debug)]
+struct BatteryStatus {
+    percent: u8,
+    charging: bool,
+}
+
+// Razer power class: 0x07/0x80 = battery level, 0x07/0x84 = charging status.
+// Response arrives on arguments[1] (report byte[9]): 0-255 for level, 0/1 for charging.
+fn battery_query_report(command_id: u8) -> [u8; REPORT_LEN] {
+    let mut bytes = [0u8; REPORT_LEN];
+    bytes[1] = 0x1F; // tx_id
+    bytes[5] = 0x02; // data_size
+    bytes[6] = 0x07; // class: power
+    bytes[7] = command_id;
+    bytes[88] = compute_crc(&bytes);
+    bytes
+}
+
+fn query_battery(file: &std::fs::File) -> Result<BatteryStatus> {
+    let level_resp = exchange_feature_report(file, &battery_query_report(0x80))
+        .context("battery level query failed")?;
+    let charge_resp = exchange_feature_report(file, &battery_query_report(0x84))
+        .context("charging status query failed")?;
+
+    let raw_level = level_resp[9];
+    let percent = ((raw_level as u32 * 100) / 255) as u8;
+    let charging = charge_resp[9] != 0;
+
+    Ok(BatteryStatus { percent, charging })
+}
+
 fn find_mouse_controller() -> Option<DeviceController> {
     // Direct USB (wired or dedicated wireless dongle)
     let direct = [
@@ -311,11 +382,23 @@ fn main() -> Result<()> {
     let dock = DeviceController::new(DeviceSpec::mouse_dock_pro(), dock_rgb_report);
     let mouse = find_mouse_controller();
 
-    match (cli.check, cli.color) {
-        (true, None) => run_check(&dock, mouse.as_ref()),
-        (false, Some(color_name)) => run_set_color(&dock, mouse.as_ref(), color_name),
-        _ => bail!("specify exactly one action: --check or --color"),
+    match (cli.check, cli.color, cli.battery) {
+        (true, None, false) => run_check(&dock, mouse.as_ref()),
+        (false, Some(color_name), false) => run_set_color(&dock, mouse.as_ref(), color_name),
+        (false, None, true) => run_battery(mouse.as_ref()),
+        _ => bail!("specify exactly one action: --check, --color, or --battery"),
     }
+}
+
+fn run_battery(mouse: Option<&DeviceController>) -> Result<()> {
+    let ctrl = mouse.context("mouse not detected — battery query requires the Basilisk")?;
+    let path = ctrl.open_hidraw_path()?;
+    let file = open_hidraw(&path)?;
+    let status = query_battery(&file)?;
+
+    let charging = if status.charging { " (charging)" } else { "" };
+    println!("✓ Battery: {}%{}", status.percent, charging);
+    Ok(())
 }
 
 fn run_check(dock: &DeviceController, mouse: Option<&DeviceController>) -> Result<()> {
