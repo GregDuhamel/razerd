@@ -1,0 +1,13 @@
+[Unit]
+Description=Razer RGB color hold (re-applies on wireless mouse wake)
+
+[Service]
+# Long-running: blocks on the dock's input stream and re-applies the color
+# the moment the mouse wakes, instead of re-firing on a fixed timer.
+Type=simple
+ExecStart=%h/.local/bin/razerd --watch blue
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

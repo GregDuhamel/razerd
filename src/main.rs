@@ -73,6 +73,21 @@ const STATUS_NEW: u8 = 0x00; // not processed yet
 const STATUS_BUSY: u8 = 0x01; // accepted, still working (RF round-trip pending)
 const STATUS_OK: u8 = 0x02; // completed, payload valid
 
+// ---------- Watch-mode tuning ----------
+
+// `--watch` re-applies the color when the mouse wakes. The dock emits no
+// dedicated wake event — it just resumes forwarding mouse-motion input reports
+// the instant the mouse comes back. So we treat "input resumed after a quiet
+// gap of at least this long" as a wake. It must sit above an ordinary pause in
+// movement yet below the mouse's own sleep timeout (Razer's is much longer).
+const WAKE_IDLE_THRESHOLD: Duration = Duration::from_secs(5);
+
+// While the mouse is in use we also re-apply the color on this cadence, as a
+// safety net against the firmware drifting back to its onboard default for no
+// visible reason. We skip it entirely when the mouse has been idle, so a
+// sleeping or absent mouse costs nothing.
+const WATCH_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
+
 // Linux hidraw ioctl numbers: _IOC(_IOC_WRITE|_IOC_READ, 'H', {0x06,0x07}, len)
 fn hidioc_set_feature(len: usize) -> u64 {
     (3u64 << 30) | ((b'H' as u64) << 8) | 0x06 | ((len as u64) << 16)
@@ -88,24 +103,28 @@ fn hidioc_get_feature(len: usize) -> u64 {
 #[command(author, version, about)]
 struct Cli {
     /// Verify the dock is detected and accessible.
-    #[arg(long, conflicts_with_all = ["color", "battery", "info", "sniff"])]
+    #[arg(long, conflicts_with_all = ["color", "battery", "info", "sniff", "watch"])]
     check: bool,
 
     /// Apply a color to the dock and the wireless mouse.
-    #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info", "sniff"])]
+    #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info", "sniff", "watch"])]
     color: Option<ColorName>,
 
     /// Print the mouse battery level and charging status.
-    #[arg(long, conflicts_with_all = ["check", "color", "info", "sniff"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "info", "sniff", "watch"])]
     battery: bool,
 
     /// Print a full device report (serial, firmware, battery, DPI, ...).
-    #[arg(long, conflicts_with_all = ["check", "color", "battery", "sniff"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "battery", "sniff", "watch"])]
     info: bool,
 
     /// Dump timestamped HID input reports from the dock (diagnostic).
-    #[arg(long, conflicts_with_all = ["check", "color", "battery", "info"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "battery", "info", "watch"])]
     sniff: bool,
+
+    /// Hold a color, re-applying it whenever the mouse wakes (runs until stopped).
+    #[arg(long, value_enum, value_name = "COLOR", conflicts_with_all = ["check", "color", "battery", "info", "sniff"])]
+    watch: Option<ColorName>,
 }
 
 enum Action {
@@ -114,19 +133,28 @@ enum Action {
     Battery,
     Info,
     Sniff,
+    Watch(ColorName),
 }
 
 impl Cli {
     fn action(&self) -> Result<Action> {
-        match (self.check, self.color, self.battery, self.info, self.sniff) {
-            (true, None, false, false, false) => Ok(Action::Check),
-            (false, Some(c), false, false, false) => Ok(Action::Color(c)),
-            (false, None, true, false, false) => Ok(Action::Battery),
-            (false, None, false, true, false) => Ok(Action::Info),
-            (false, None, false, false, true) => Ok(Action::Sniff),
-            _ => {
-                bail!("specify exactly one action: --check, --color, --battery, --info, or --sniff")
-            }
+        match (
+            self.check,
+            self.color,
+            self.battery,
+            self.info,
+            self.sniff,
+            self.watch,
+        ) {
+            (true, None, false, false, false, None) => Ok(Action::Check),
+            (false, Some(c), false, false, false, None) => Ok(Action::Color(c)),
+            (false, None, true, false, false, None) => Ok(Action::Battery),
+            (false, None, false, true, false, None) => Ok(Action::Info),
+            (false, None, false, false, true, None) => Ok(Action::Sniff),
+            (false, None, false, false, false, Some(c)) => Ok(Action::Watch(c)),
+            _ => bail!(
+                "specify exactly one action: --check, --color, --battery, --info, --sniff, or --watch"
+            ),
         }
     }
 }
@@ -539,6 +567,7 @@ fn main() -> Result<()> {
         Action::Battery => run_battery(&dock),
         Action::Info => run_info(&dock),
         Action::Sniff => run_sniff(&dock),
+        Action::Watch(c) => run_watch(&dock, c),
     }
 }
 
@@ -554,18 +583,23 @@ fn run_check(dock: &HidrawDevice) -> Result<()> {
     Ok(())
 }
 
-fn run_color(dock: &HidrawDevice, color: ColorName) -> Result<()> {
+/// Push `color` to the dock ring and, via RF, to the mouse. Silent so it can be
+/// called repeatedly by `--watch`.
+fn apply_color(dock: &HidrawDevice, color: ColorName) -> Result<()> {
     let label = color.as_str();
-
     dock.send_feature(&dock_rgb_report(color.rgb()))
         .with_context(|| format!("failed to set dock color '{label}'"))?;
-    println!("✓ Dock: {label}");
-
     // Sent through the dock; if the mouse is not paired, the dock drops it silently.
     dock.send_feature(&mouse_via_dock_rgb_report(color.rgb()))
         .with_context(|| format!("failed to set mouse color '{label}'"))?;
-    println!("✓ Mouse: {label}");
+    Ok(())
+}
 
+fn run_color(dock: &HidrawDevice, color: ColorName) -> Result<()> {
+    apply_color(dock, color)?;
+    let label = color.as_str();
+    println!("✓ Dock: {label}");
+    println!("✓ Mouse: {label}");
     Ok(())
 }
 
@@ -588,6 +622,81 @@ fn run_sniff(dock: &HidrawDevice) -> Result<()> {
         let elapsed = start.elapsed().as_secs_f64();
         let hex: Vec<String> = buf[..n].iter().map(|b| format!("{b:02x}")).collect();
         println!("[{elapsed:8.3}s] {n:3} bytes: {}", hex.join(" "));
+    }
+}
+
+/// Should we re-apply the color when an input report arrives after `idle_gap`
+/// of silence? Only when the gap is long enough to mean the mouse actually
+/// slept — a brief pause in movement must not trigger a re-apply.
+fn should_reapply_on_wake(idle_gap: Duration) -> bool {
+    idle_gap >= WAKE_IDLE_THRESHOLD
+}
+
+/// Hold `color` persistently: re-apply it the moment the mouse wakes (detected
+/// as input resuming after a quiet gap) and, while the mouse is in use, on a
+/// slow safety cadence to correct any spontaneous drift. Runs until the process
+/// is signalled (Ctrl-C, or `systemctl stop`).
+fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
+    apply_color(dock, color).context("initial color apply failed")?;
+    println!(
+        "Watching {} — holding '{}', re-applying on wake. Ctrl-C to stop.",
+        dock.path.display(),
+        color.as_str()
+    );
+
+    let mut pfd = libc::pollfd {
+        fd: dock.file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = WATCH_SAFETY_INTERVAL.as_millis() as libc::c_int;
+
+    let mut buf = [0u8; 256];
+    let mut last_input = Instant::now();
+    let mut active_since_safety = false;
+
+    loop {
+        // SAFETY: one valid pollfd over an owned fd; the kernel only writes
+        // `revents`. A negative return means error, with errno set.
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR (benign signal) — just retry the poll
+            }
+            bail!("poll on {} failed: {err}", dock.path.display());
+        }
+
+        if ret == 0 {
+            // Safety cadence elapsed. Re-apply only if the mouse has been used
+            // since the last safety apply, so a sleeping/absent mouse is free.
+            if active_since_safety {
+                apply_color(dock, color).context("safety re-apply failed")?;
+                active_since_safety = false;
+                println!("re-applied '{}' (safety refresh)", color.as_str());
+            }
+            continue;
+        }
+
+        // Input is ready, so this read won't block. Handling one report per
+        // iteration is fine — a burst just makes the next poll return at once.
+        let n = dock.read_input_report(&mut buf)?;
+        if n == 0 {
+            continue;
+        }
+        let now = Instant::now();
+        let idle_gap = now.duration_since(last_input);
+        last_input = now;
+        active_since_safety = true;
+
+        if should_reapply_on_wake(idle_gap) {
+            apply_color(dock, color).context("wake re-apply failed")?;
+            println!(
+                "re-applied '{}' (mouse woke after {:.0}s idle)",
+                color.as_str(),
+                idle_gap.as_secs_f64()
+            );
+        }
     }
 }
 
@@ -768,6 +877,7 @@ mod tests {
             battery: false,
             info: false,
             sniff: false,
+            watch: None,
         };
         assert!(cli.action().is_err());
 
@@ -780,6 +890,18 @@ mod tests {
             cli.action().unwrap(),
             Action::Color(ColorName::Blue)
         ));
+    }
+
+    #[test]
+    fn watch_reapplies_only_after_a_real_idle_gap() {
+        // Brief pauses in movement must not re-apply.
+        assert!(!should_reapply_on_wake(Duration::from_millis(500)));
+        assert!(!should_reapply_on_wake(
+            WAKE_IDLE_THRESHOLD - Duration::from_millis(1)
+        ));
+        // A gap at/above the threshold means the mouse slept → re-apply.
+        assert!(should_reapply_on_wake(WAKE_IDLE_THRESHOLD));
+        assert!(should_reapply_on_wake(Duration::from_secs(120)));
     }
 
     #[test]
