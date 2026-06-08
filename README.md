@@ -19,6 +19,7 @@ When the mouse is connected wirelessly through the dock, razerd sends a single c
 
 ```
 razerd --color <COLOR>
+razerd --watch <COLOR>
 razerd --check
 razerd --battery
 razerd --info
@@ -29,7 +30,8 @@ razerd --sniff
 
 | Flag | Description |
 |---|---|
-| `--color red\|green\|blue\|white\|off` | Apply color to dock and mouse |
+| `--color red\|green\|blue\|white\|off` | Apply color to dock and mouse once |
+| `--watch red\|green\|blue\|white\|off` | Hold a color, re-applying it whenever the mouse wakes (runs until stopped) |
 | `--check` | Verify devices are detected and accessible |
 | `--battery` | Report mouse battery percentage and charging status |
 | `--info` | Full device report: serial, firmware, battery, DPI |
@@ -60,6 +62,19 @@ Razer Basilisk V3 Pro 35K (via Dock)
   Charging: no
   DPI:      1800
 ```
+
+### Holding a color: `--watch`
+
+A wireless mouse forgets its color when it goes to sleep, and the firmware can drift back to its onboard default on its own. `--watch` keeps a long-running process that re-applies the color **the moment the mouse wakes**, instead of re-firing on a fixed timer.
+
+```bash
+razerd --watch blue
+# Watching /dev/hidraw0 — holding 'blue', re-applying on wake. Ctrl-C to stop.
+```
+
+How it works: the dock emits no dedicated wake event, but it resumes forwarding mouse-motion input reports the instant the mouse comes back. `--watch` waits on that input stream and treats *input resuming after a quiet gap* as a wake, re-applying the color within milliseconds. While the mouse is in use it also re-applies on a slow safety cadence (every 60s) to correct any spontaneous drift — and it stays completely idle while the mouse is asleep or absent, so there is no periodic wakeup cost.
+
+This is the recommended alternative to the `razerd.timer` approach (see [Installation](#3-optional-systemd-user-service)): lower latency on wake, and no fixed-interval churn. Run **one** of the two, not both.
 
 ### Diagnostics: `--sniff`
 
@@ -108,7 +123,25 @@ Log out and back in, then verify:
 razerd --check
 ```
 
-### 3. (Optional) systemd user service + timer
+### 3. (Optional) systemd user service
+
+Keeping the color in sync after the wireless mouse sleeps or drops off the dock's RF link needs a background job. There are two approaches — **pick one, not both.**
+
+#### Option A (recommended): `--watch` service
+
+```bash
+make install-watch
+```
+
+Installs and enables `razerd-watch.service`, a single long-running process (`razerd --watch blue`) that re-applies the color **the moment the mouse wakes** and stays idle otherwise. Lower latency than the timer, and no fixed-interval churn. See [Holding a color: `--watch`](#holding-a-color---watch).
+
+```bash
+systemctl --user edit razerd-watch.service   # change --watch <color>
+```
+
+Remove with `make uninstall-watch`.
+
+#### Option B: service + 30s timer
 
 ```bash
 make install-service
@@ -118,13 +151,7 @@ This installs and enables:
 - `razerd.service` — applies the color once (blue by default)
 - `razerd.timer` — re-fires the service every 30 seconds
 
-The timer is important: when the wireless mouse drops off the dock's RF link (power save, lifted off the dock, etc.) it may forget the color. Re-applying periodically keeps everything in sync, which is exactly what Razer Synapse does on Windows.
-
-To also run at **boot** before you log in:
-
-```bash
-sudo loginctl enable-linger $USER
-```
+A simpler, stateless approach that just re-applies the color on a fixed interval, like Razer Synapse does on Windows. Higher latency (up to 30s after a wake) and it fires even when the mouse is asleep.
 
 **Change the color** without editing the file manually:
 
@@ -134,6 +161,14 @@ systemctl --user edit razerd.timer       # change OnUnitActiveSec interval
 ```
 
 Remove with `make uninstall-service`.
+
+---
+
+To also run either option at **boot** before you log in:
+
+```bash
+sudo loginctl enable-linger $USER
+```
 
 ### 4. (Optional) Low-battery desktop notifications
 
@@ -174,12 +209,14 @@ The protocol was reverse-engineered from USB captures of Razer Synapse on Window
 ## Development
 
 ```bash
-make build          # cargo build --release
-make install        # build + copy to ~/.local/bin/
-make install-service # install + enable systemd user service
+make build           # cargo build --release
+make install         # build + copy to ~/.local/bin/
+make install-watch   # install + enable the --watch systemd service (recommended)
+make install-service # install + enable the service + 30s timer (alternative)
 make uninstall
+make uninstall-watch
 make uninstall-service
-make clean          # cargo clean
+make clean           # cargo clean
 ```
 
 CI runs `cargo fmt --check`, `cargo check`, `cargo clippy -D warnings`, `cargo doc -D warnings`, and a release build on every push and PR.
