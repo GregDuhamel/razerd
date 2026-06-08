@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------- USB / HID constants ----------
 
@@ -60,9 +60,18 @@ const MOUSE_LED_DATA_SIZE: u8 = 0x2C;
 const MOUSE_LED_ZONES: usize = 13;
 const MOUSE_LED_COUNT_MINUS_ONE: u8 = (MOUSE_LED_ZONES as u8) - 1;
 
-// Window given to the dock to forward a request to the mouse over RF and
-// queue the reply before we read it back.
-const RESPONSE_WAIT: Duration = Duration::from_millis(50);
+// The firmware writes a status code into byte 0 of the response once it has
+// processed a request (and, for mouse queries, completed the RF round-trip).
+// We poll for it rather than sleeping a fixed worst-case interval: replies are
+// usually ready within a few milliseconds, but a sleeping/absent mouse can take
+// longer or never answer.
+const RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
+const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+// Response status byte (`response[0]`) values used by the Razer firmware.
+const STATUS_NEW: u8 = 0x00; // not processed yet
+const STATUS_BUSY: u8 = 0x01; // accepted, still working (RF round-trip pending)
+const STATUS_OK: u8 = 0x02; // completed, payload valid
 
 // Linux hidraw ioctl numbers: _IOC(_IOC_WRITE|_IOC_READ, 'H', {0x06,0x07}, len)
 fn hidioc_set_feature(len: usize) -> u64 {
@@ -204,11 +213,8 @@ impl HidrawDevice {
         Ok(())
     }
 
-    /// Send a request and read back the matching 90-byte response.
-    fn exchange_feature(&self, request: &[u8; REPORT_LEN]) -> Result<[u8; REPORT_LEN]> {
-        self.send_feature(request)?;
-        std::thread::sleep(RESPONSE_WAIT);
-
+    /// Read the current 90-byte feature report (GET_REPORT with type=feature).
+    fn get_feature(&self) -> Result<[u8; REPORT_LEN]> {
         let mut buf = [0u8; REPORT_LEN + 1];
 
         // SAFETY: same invariants as `send_feature`; `HIDIOCGFEATURE` writes at
@@ -227,6 +233,47 @@ impl HidrawDevice {
         let mut response = [0u8; REPORT_LEN];
         response.copy_from_slice(&buf[1..]);
         Ok(response)
+    }
+
+    /// Send a request and poll for the matching 90-byte response, returning it
+    /// only once the firmware reports the transaction as completed.
+    fn exchange_feature(&self, request: &[u8; REPORT_LEN]) -> Result<[u8; REPORT_LEN]> {
+        self.send_feature(request)?;
+
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        loop {
+            std::thread::sleep(RESPONSE_POLL_INTERVAL);
+            let response = self.get_feature()?;
+            match classify_response_status(response[0]) {
+                ResponseStatus::Ready => return Ok(response),
+                ResponseStatus::Pending if Instant::now() < deadline => continue,
+                ResponseStatus::Pending => {
+                    bail!("device did not answer within {RESPONSE_TIMEOUT:?}")
+                }
+                ResponseStatus::Failed(status) => {
+                    bail!("device returned error status 0x{status:02x}")
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of inspecting a response's status byte (`response[0]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseStatus {
+    /// Completed successfully; the payload is valid.
+    Ready,
+    /// Still being processed — keep polling until the deadline.
+    Pending,
+    /// Terminal failure (e.g. unsupported, no RF response); carries the raw code.
+    Failed(u8),
+}
+
+fn classify_response_status(status: u8) -> ResponseStatus {
+    match status {
+        STATUS_OK => ResponseStatus::Ready,
+        STATUS_NEW | STATUS_BUSY => ResponseStatus::Pending,
+        other => ResponseStatus::Failed(other),
     }
 }
 
@@ -688,6 +735,22 @@ mod tests {
             cli.action().unwrap(),
             Action::Color(ColorName::Blue)
         ));
+    }
+
+    #[test]
+    fn classify_response_status_maps_codes() {
+        assert_eq!(classify_response_status(STATUS_OK), ResponseStatus::Ready);
+        assert_eq!(
+            classify_response_status(STATUS_NEW),
+            ResponseStatus::Pending
+        );
+        assert_eq!(
+            classify_response_status(STATUS_BUSY),
+            ResponseStatus::Pending
+        );
+        // 0x03 failure, 0x04 no-response, 0x05 unsupported — all terminal.
+        assert_eq!(classify_response_status(0x03), ResponseStatus::Failed(0x03));
+        assert_eq!(classify_response_status(0x05), ResponseStatus::Failed(0x05));
     }
 
     /// Regression test: HIDIOCSFEATURE for a 91-byte buffer must match what
