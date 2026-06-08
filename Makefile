@@ -24,7 +24,6 @@ install-watch: install
 	systemctl --user daemon-reload
 	systemctl --user enable --now razerd-watch.service
 	@echo "✓ watch service enabled (re-applies color the moment the mouse wakes)"
-	@echo "  This replaces the timer approach — don't run both at once."
 	@echo "  Run 'sudo loginctl enable-linger $$USER' to start at boot without logging in"
 	@echo "  Edit color: systemctl --user edit razerd-watch.service  (change --watch <color>)"
 
