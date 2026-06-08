@@ -27,6 +27,9 @@ const HID_ID_USB_PREFIX: &str = "0003";
 // Razer HID feature report fixed size.
 const REPORT_LEN: usize = 90;
 
+// The 1-byte XOR checksum sits at this offset and covers bytes `2..CRC_INDEX`.
+const CRC_INDEX: usize = 88;
+
 // ---------- Razer protocol constants ----------
 
 // Transaction id conventions observed on this hardware:
@@ -138,20 +141,21 @@ enum Action {
 
 impl Cli {
     fn action(&self) -> Result<Action> {
-        match (
-            self.check,
-            self.color,
-            self.battery,
-            self.info,
-            self.sniff,
-            self.watch,
-        ) {
-            (true, None, false, false, false, None) => Ok(Action::Check),
-            (false, Some(c), false, false, false, None) => Ok(Action::Color(c)),
-            (false, None, true, false, false, None) => Ok(Action::Battery),
-            (false, None, false, true, false, None) => Ok(Action::Info),
-            (false, None, false, false, true, None) => Ok(Action::Sniff),
-            (false, None, false, false, false, Some(c)) => Ok(Action::Watch(c)),
+        // clap already enforces mutual exclusion; this maps the one set flag to
+        // its action and rejects the "no action given" case.
+        let mut chosen = [
+            self.check.then_some(Action::Check),
+            self.color.map(Action::Color),
+            self.battery.then_some(Action::Battery),
+            self.info.then_some(Action::Info),
+            self.sniff.then_some(Action::Sniff),
+            self.watch.map(Action::Watch),
+        ]
+        .into_iter()
+        .flatten();
+
+        match (chosen.next(), chosen.next()) {
+            (Some(action), None) => Ok(action),
             _ => bail!(
                 "specify exactly one action: --check, --color, --battery, --info, --sniff, or --watch"
             ),
@@ -380,9 +384,9 @@ fn hidraw_interface_number(hidraw_sysfs_path: &Path) -> Option<u8> {
 
 // ---------- Protocol: report builders ----------
 
-/// XOR of bytes 2..=87, the Razer HID report checksum.
+/// XOR of bytes `2..CRC_INDEX`, the Razer HID report checksum.
 fn compute_crc(bytes: &[u8; REPORT_LEN]) -> u8 {
-    bytes[2..88].iter().fold(0u8, |acc, b| acc ^ b)
+    bytes[2..CRC_INDEX].iter().fold(0u8, |acc, b| acc ^ b)
 }
 
 /// Populate the common fixed-size header used by all LED matrix reports and
@@ -420,7 +424,7 @@ fn dock_rgb_report(color: Rgb) -> [u8; REPORT_LEN] {
         DOCK_LED_COUNT_MINUS_ONE,
     );
     fill_leds(&mut bytes, start, DOCK_LED_ZONES, color);
-    bytes[88] = compute_crc(&bytes);
+    bytes[CRC_INDEX] = compute_crc(&bytes);
     bytes
 }
 
@@ -435,7 +439,7 @@ fn mouse_via_dock_rgb_report(color: Rgb) -> [u8; REPORT_LEN] {
         MOUSE_LED_COUNT_MINUS_ONE,
     );
     fill_leds(&mut bytes, start, MOUSE_LED_ZONES, color);
-    bytes[88] = compute_crc(&bytes);
+    bytes[CRC_INDEX] = compute_crc(&bytes);
     bytes
 }
 
@@ -444,7 +448,7 @@ fn mouse_via_dock_rgb_report(color: Rgb) -> [u8; REPORT_LEN] {
 /// Build a query report: `[_, tx_id, 0, 0, 0, data_size, class, cmd, args..., _, crc, _]`.
 fn build_query(tx_id: u8, class: u8, cmd: u8, data_size: u8, args: &[u8]) -> [u8; REPORT_LEN] {
     assert!(
-        8 + args.len() <= 88,
+        8 + args.len() <= CRC_INDEX,
         "query arguments overflow the report body"
     );
 
@@ -454,7 +458,7 @@ fn build_query(tx_id: u8, class: u8, cmd: u8, data_size: u8, args: &[u8]) -> [u8
     bytes[6] = class;
     bytes[7] = cmd;
     bytes[8..8 + args.len()].copy_from_slice(args);
-    bytes[88] = compute_crc(&bytes);
+    bytes[CRC_INDEX] = compute_crc(&bytes);
     bytes
 }
 
