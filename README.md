@@ -74,7 +74,7 @@ razerd --watch blue
 
 How it works: the dock emits no dedicated wake event, but it resumes forwarding mouse-motion input reports the instant the mouse comes back. `--watch` waits on that input stream and treats *input resuming after a quiet gap* as a wake, re-applying the color within milliseconds. While the mouse is in use it also re-applies on a slow safety cadence (every 60s) to correct any spontaneous drift — and it stays completely idle while the mouse is asleep or absent, so there is no periodic wakeup cost.
 
-This is the recommended alternative to the `razerd.timer` approach (see [Installation](#3-optional-systemd-user-service)): lower latency on wake, and no fixed-interval churn. Run **one** of the two, not both.
+Run it as a background service to keep your color persistent — see [Installation](#3-optional-systemd-user-service).
 
 ### Diagnostics: `--sniff`
 
@@ -125,15 +125,15 @@ razerd --check
 
 ### 3. (Optional) systemd user service
 
-Keeping the color in sync after the wireless mouse sleeps or drops off the dock's RF link needs a background job. There are two approaches — **pick one, not both.**
-
-#### Option A (recommended): `--watch` service
+Keeping the color in sync after the wireless mouse sleeps or drops off the dock's RF link needs a background job:
 
 ```bash
 make install-watch
 ```
 
-Installs and enables `razerd-watch.service`, a single long-running process (`razerd --watch blue`) that re-applies the color **the moment the mouse wakes** and stays idle otherwise. Lower latency than the timer, and no fixed-interval churn. See [Holding a color: `--watch`](#holding-a-color---watch).
+Installs and enables `razerd-watch.service`, a single long-running process (`razerd --watch blue`) that re-applies the color **the moment the mouse wakes** and stays idle otherwise — no fixed-interval churn. See [Holding a color: `--watch`](#holding-a-color---watch).
+
+**Change the color**:
 
 ```bash
 systemctl --user edit razerd-watch.service   # change --watch <color>
@@ -141,30 +141,7 @@ systemctl --user edit razerd-watch.service   # change --watch <color>
 
 Remove with `make uninstall-watch`.
 
-#### Option B: service + 30s timer
-
-```bash
-make install-service
-```
-
-This installs and enables:
-- `razerd.service` — applies the color once (blue by default)
-- `razerd.timer` — re-fires the service every 30 seconds
-
-A simpler, stateless approach that just re-applies the color on a fixed interval, like Razer Synapse does on Windows. Higher latency (up to 30s after a wake) and it fires even when the mouse is asleep.
-
-**Change the color** without editing the file manually:
-
-```bash
-systemctl --user edit razerd.service     # change ExecStart
-systemctl --user edit razerd.timer       # change OnUnitActiveSec interval
-```
-
-Remove with `make uninstall-service`.
-
----
-
-To also run either option at **boot** before you log in:
+To also run at **boot** before you log in:
 
 ```bash
 sudo loginctl enable-linger $USER
@@ -209,14 +186,12 @@ The protocol was reverse-engineered from USB captures of Razer Synapse on Window
 ## Development
 
 ```bash
-make build           # cargo build --release
-make install         # build + copy to ~/.local/bin/
-make install-watch   # install + enable the --watch systemd service (recommended)
-make install-service # install + enable the service + 30s timer (alternative)
+make build         # cargo build --release
+make install       # build + copy to ~/.local/bin/
+make install-watch # install + enable the --watch systemd service
 make uninstall
 make uninstall-watch
-make uninstall-service
-make clean           # cargo clean
+make clean         # cargo clean
 ```
 
 CI runs `cargo fmt --check`, `cargo check`, `cargo clippy -D warnings`, `cargo doc -D warnings`, and a release build on every push and PR.

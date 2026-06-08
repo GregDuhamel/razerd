@@ -1,11 +1,9 @@
-.PHONY: build install uninstall install-service uninstall-service install-watch uninstall-watch install-notify uninstall-notify clean
+.PHONY: build install uninstall install-watch uninstall-watch install-notify uninstall-notify clean
 
 PREFIX          ?= $(HOME)/.local
 BIN             := $(PREFIX)/bin/razerd
 NOTIFY_BIN      := $(PREFIX)/bin/razerd-battery-notify
 UNIT_DIR        := $(HOME)/.config/systemd/user
-UNIT            := $(UNIT_DIR)/razerd.service
-TIMER           := $(UNIT_DIR)/razerd.timer
 WATCH_UNIT      := $(UNIT_DIR)/razerd-watch.service
 NOTIFY_UNIT     := $(UNIT_DIR)/razerd-battery-notify.service
 NOTIFY_TIMER    := $(UNIT_DIR)/razerd-battery-notify.timer
@@ -20,22 +18,6 @@ install: build
 uninstall:
 	rm -f $(BIN)
 	@echo "✓ removed: $(BIN)"
-
-install-service: install
-	install -Dm 0644 razerd.service $(UNIT)
-	install -Dm 0644 razerd.timer $(TIMER)
-	systemctl --user daemon-reload
-	systemctl --user enable --now razerd.service razerd.timer
-	@echo "✓ service + 30s timer enabled (re-applies color on wireless reconnects)"
-	@echo "  Run 'sudo loginctl enable-linger $$USER' to start at boot without logging in"
-	@echo "  Edit color:    systemctl --user edit razerd.service"
-	@echo "  Edit interval: systemctl --user edit razerd.timer"
-
-uninstall-service:
-	-systemctl --user disable --now razerd.timer razerd.service
-	rm -f $(UNIT) $(TIMER)
-	systemctl --user daemon-reload
-	@echo "✓ service and timer removed"
 
 install-watch: install
 	install -Dm 0644 razerd-watch.service $(WATCH_UNIT)
