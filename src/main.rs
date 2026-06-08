@@ -88,20 +88,24 @@ fn hidioc_get_feature(len: usize) -> u64 {
 #[command(author, version, about)]
 struct Cli {
     /// Verify the dock is detected and accessible.
-    #[arg(long, conflicts_with_all = ["color", "battery", "info"])]
+    #[arg(long, conflicts_with_all = ["color", "battery", "info", "sniff"])]
     check: bool,
 
     /// Apply a color to the dock and the wireless mouse.
-    #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info"])]
+    #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info", "sniff"])]
     color: Option<ColorName>,
 
     /// Print the mouse battery level and charging status.
-    #[arg(long, conflicts_with_all = ["check", "color", "info"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "info", "sniff"])]
     battery: bool,
 
     /// Print a full device report (serial, firmware, battery, DPI, ...).
-    #[arg(long, conflicts_with_all = ["check", "color", "battery"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "battery", "sniff"])]
     info: bool,
+
+    /// Dump timestamped HID input reports from the dock (diagnostic).
+    #[arg(long, conflicts_with_all = ["check", "color", "battery", "info"])]
+    sniff: bool,
 }
 
 enum Action {
@@ -109,16 +113,20 @@ enum Action {
     Color(ColorName),
     Battery,
     Info,
+    Sniff,
 }
 
 impl Cli {
     fn action(&self) -> Result<Action> {
-        match (self.check, self.color, self.battery, self.info) {
-            (true, None, false, false) => Ok(Action::Check),
-            (false, Some(c), false, false) => Ok(Action::Color(c)),
-            (false, None, true, false) => Ok(Action::Battery),
-            (false, None, false, true) => Ok(Action::Info),
-            _ => bail!("specify exactly one action: --check, --color, --battery, or --info"),
+        match (self.check, self.color, self.battery, self.info, self.sniff) {
+            (true, None, false, false, false) => Ok(Action::Check),
+            (false, Some(c), false, false, false) => Ok(Action::Color(c)),
+            (false, None, true, false, false) => Ok(Action::Battery),
+            (false, None, false, true, false) => Ok(Action::Info),
+            (false, None, false, false, true) => Ok(Action::Sniff),
+            _ => {
+                bail!("specify exactly one action: --check, --color, --battery, --info, or --sniff")
+            }
         }
     }
 }
@@ -233,6 +241,19 @@ impl HidrawDevice {
         let mut response = [0u8; REPORT_LEN];
         response.copy_from_slice(&buf[1..]);
         Ok(response)
+    }
+
+    /// Block until the device emits an input report, returning its length.
+    ///
+    /// Unlike feature reports (which we pull on demand via ioctl), hidraw
+    /// delivers the device's spontaneous input reports through `read()`. The
+    /// dock uses these to announce events such as the RF mouse connecting or
+    /// disconnecting — which is exactly what `--sniff` is here to surface.
+    fn read_input_report(&self, buf: &mut [u8]) -> Result<usize> {
+        use std::io::Read;
+        (&self.file)
+            .read(buf)
+            .context("reading hidraw input report")
     }
 
     /// Send a request and poll for the matching 90-byte response, returning it
@@ -517,6 +538,7 @@ fn main() -> Result<()> {
         Action::Color(c) => run_color(&dock, c),
         Action::Battery => run_battery(&dock),
         Action::Info => run_info(&dock),
+        Action::Sniff => run_sniff(&dock),
     }
 }
 
@@ -545,6 +567,28 @@ fn run_color(dock: &HidrawDevice, color: ColorName) -> Result<()> {
     println!("✓ Mouse: {label}");
 
     Ok(())
+}
+
+/// Diagnostic: print every HID input report the dock emits, with a relative
+/// timestamp. Run it, then exercise the mouse (let it sleep, then move it to
+/// wake it) and watch whether reports appear at the sleep/wake moments. Runs
+/// until interrupted with Ctrl-C.
+fn run_sniff(dock: &HidrawDevice) -> Result<()> {
+    println!("Sniffing input reports from {}.", dock.path.display());
+    println!("Exercise the mouse: let it sleep, then move it to wake it.");
+    println!("Press Ctrl-C to stop.\n");
+
+    let start = Instant::now();
+    let mut buf = [0u8; 256];
+    loop {
+        let n = dock.read_input_report(&mut buf)?;
+        if n == 0 {
+            continue;
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let hex: Vec<String> = buf[..n].iter().map(|b| format!("{b:02x}")).collect();
+        println!("[{elapsed:8.3}s] {n:3} bytes: {}", hex.join(" "));
+    }
 }
 
 fn run_battery(dock: &HidrawDevice) -> Result<()> {
@@ -723,6 +767,7 @@ mod tests {
             color: None,
             battery: false,
             info: false,
+            sniff: false,
         };
         assert!(cli.action().is_err());
 

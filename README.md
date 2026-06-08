@@ -22,6 +22,7 @@ razerd --color <COLOR>
 razerd --check
 razerd --battery
 razerd --info
+razerd --sniff
 ```
 
 ### Options
@@ -32,6 +33,7 @@ razerd --info
 | `--check` | Verify devices are detected and accessible |
 | `--battery` | Report mouse battery percentage and charging status |
 | `--info` | Full device report: serial, firmware, battery, DPI |
+| `--sniff` | Diagnostic: dump timestamped HID input reports from the dock (Ctrl-C to stop) |
 
 ### Examples
 
@@ -58,6 +60,23 @@ Razer Basilisk V3 Pro 35K (via Dock)
   Charging: no
   DPI:      1800
 ```
+
+### Diagnostics: `--sniff`
+
+`--sniff` opens the dock's hidraw interface and prints every HID **input** report it emits, with a timestamp relative to start. It is a read-only diagnostic — it sends nothing — used to observe how the dock behaves over time (e.g. what it reports when the wireless mouse sleeps and wakes).
+
+```bash
+razerd --sniff
+# Sniffing input reports from /dev/hidraw0.
+# Exercise the mouse: let it sleep, then move it to wake it.
+# Press Ctrl-C to stop.
+#
+# [  12.767s]   8 bytes: 00 00 00 00 03 00 02 00
+# [  12.768s]   8 bytes: 00 00 00 00 04 00 02 00
+# ...
+```
+
+The reports are standard 8-byte mouse-motion packets — bytes 4–5 are the signed little-endian X delta, bytes 6–7 the Y delta. While the mouse is asleep the device stays silent (the read simply blocks); reports resume the instant the mouse wakes. Reading these reports is a parallel tap on hidraw and does **not** interfere with normal cursor movement.
 
 ## Installation
 
