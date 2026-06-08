@@ -673,6 +673,7 @@ fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
             if active_since_safety {
                 apply_color(dock, color).context("safety re-apply failed")?;
                 active_since_safety = false;
+                println!("re-applied '{}' (safety refresh)", color.as_str());
             }
             continue;
         }
@@ -690,6 +691,11 @@ fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
 
         if should_reapply_on_wake(idle_gap) {
             apply_color(dock, color).context("wake re-apply failed")?;
+            println!(
+                "re-applied '{}' (mouse woke after {:.0}s idle)",
+                color.as_str(),
+                idle_gap.as_secs_f64()
+            );
         }
     }
 }
