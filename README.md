@@ -34,7 +34,7 @@ razerd --sniff
 | `--watch red\|green\|blue\|white\|off` | Hold a color, re-applying it whenever the mouse wakes (runs until stopped) |
 | `--check` | Verify devices are detected and accessible |
 | `--battery` | Report mouse battery percentage and charging status |
-| `--info` | Full device report: serial, firmware, battery, DPI |
+| `--info` | Full device report: serial, firmware, battery, DPI, onboard profile |
 | `--sniff` | Diagnostic: dump timestamped HID input reports from the dock (Ctrl-C to stop) |
 
 ### Examples
@@ -61,7 +61,10 @@ Razer Basilisk V3 Pro 35K (via Dock)
   Battery:  89%
   Charging: no
   DPI:      1800
+  Profile:  4 (blue) of 5
 ```
+
+The mouse stores 5 onboard profiles, cycled with the button on its underside; the indicator LED next to it shows the active slot's color (1 white, 2 red, 3 green, 4 blue, 5 cyan). `--info` reports the active slot.
 
 ### Holding a color: `--watch`
 
@@ -177,7 +180,7 @@ The Razer Mouse Dock Pro (`1532:00A4`) exposes three HID interfaces on USB. All 
 | `0x1D` (29) | `0x07` | 8 | Dock LED ring |
 | `0x2C` (44) | `0x0C` | 13 | Basilisk V3 Pro 35K via RF |
 
-Battery queries use command class `0x07` (power): `cmd=0x80` for level, `cmd=0x84` for charging status. The dock forwards the request over RF and the mouse's reply is read back with `HIDIOCGFEATURE`.
+Battery queries use command class `0x07` (power): `cmd=0x80` for level, `cmd=0x84` for charging status. Onboard profile queries use class `0x05`: `cmd=0x80` for the slot count, `cmd=0x84` for the active slot. The dock forwards the request over RF and the mouse's reply is read back with `HIDIOCGFEATURE`.
 
 The protocol was reverse-engineered from USB captures of Razer Synapse on Windows using Wireshark.
 

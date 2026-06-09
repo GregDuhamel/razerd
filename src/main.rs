@@ -46,6 +46,12 @@ const CMD_GET_SERIAL: u8 = 0x82;
 const CLASS_DPI: u8 = 0x04;
 const CMD_GET_DPI: u8 = 0x85;
 
+// Onboard profile slots, cycled with the button under the mouse. The
+// indicator LED next to it shows the active slot's color.
+const CLASS_PROFILE: u8 = 0x05;
+const CMD_GET_PROFILE_COUNT: u8 = 0x80;
+const CMD_GET_ACTIVE_PROFILE: u8 = 0x84;
+
 const CLASS_POWER: u8 = 0x07;
 const CMD_GET_BATTERY_LEVEL: u8 = 0x80;
 const CMD_GET_CHARGING: u8 = 0x84;
@@ -541,6 +547,59 @@ impl std::fmt::Display for FirmwareVersion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProfileInfo {
+    active: u8,
+    count: u8,
+}
+
+impl std::fmt::Display for ProfileInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match profile_color_name(self.active) {
+            Some(color) => write!(f, "{} ({}) of {}", self.active, color, self.count),
+            None => write!(f, "{} of {}", self.active, self.count),
+        }
+    }
+}
+
+/// Color shown by the mouse's profile indicator LED for each slot.
+fn profile_color_name(slot: u8) -> Option<&'static str> {
+    match slot {
+        1 => Some("white"),
+        2 => Some("red"),
+        3 => Some("green"),
+        4 => Some("blue"),
+        5 => Some("cyan"),
+        _ => None,
+    }
+}
+
+fn query_profiles(dock: &HidrawDevice) -> Result<ProfileInfo> {
+    let count = dock
+        .exchange_feature(&build_query(
+            TX_ID_MOUSE,
+            CLASS_PROFILE,
+            CMD_GET_PROFILE_COUNT,
+            0x01,
+            &[],
+        ))
+        .context("profile count query failed")?;
+    let active = dock
+        .exchange_feature(&build_query(
+            TX_ID_MOUSE,
+            CLASS_PROFILE,
+            CMD_GET_ACTIVE_PROFILE,
+            0x01,
+            &[],
+        ))
+        .context("active profile query failed")?;
+
+    Ok(ProfileInfo {
+        active: active[8],
+        count: count[8],
+    })
+}
+
 fn query_dpi(dock: &HidrawDevice) -> Result<(u16, u16)> {
     // arg[0] = VARSTORE (0x01); response carries DPI X/Y as big-endian u16 pairs.
     let resp = dock
@@ -731,6 +790,7 @@ fn run_info(dock: &HidrawDevice) -> Result<()> {
         Err(_) => println!("  Battery:  —"),
     }
     print_field("DPI", query_dpi(dock).ok().map(format_dpi));
+    print_field("Profile", query_profiles(dock).ok());
 
     Ok(())
 }
@@ -865,6 +925,35 @@ mod tests {
     fn firmware_version_formats_with_zero_padded_minor() {
         let fw = FirmwareVersion { major: 2, minor: 1 };
         assert_eq!(fw.to_string(), "2.01");
+    }
+
+    #[test]
+    fn profile_info_formats_with_indicator_color() {
+        assert_eq!(
+            ProfileInfo {
+                active: 4,
+                count: 5
+            }
+            .to_string(),
+            "4 (blue) of 5"
+        );
+        assert_eq!(
+            ProfileInfo {
+                active: 1,
+                count: 5
+            }
+            .to_string(),
+            "1 (white) of 5"
+        );
+        // Unknown slots fall back to the bare number.
+        assert_eq!(
+            ProfileInfo {
+                active: 9,
+                count: 5
+            }
+            .to_string(),
+            "9 of 5"
+        );
     }
 
     #[test]
