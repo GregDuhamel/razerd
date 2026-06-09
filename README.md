@@ -20,6 +20,7 @@ When the mouse is connected wirelessly through the dock, razerd sends a single c
 ```
 razerd --color <COLOR>
 razerd --watch <COLOR>
+razerd --dpi <DPI>
 razerd --check
 razerd --battery
 razerd --info
@@ -32,6 +33,7 @@ razerd --sniff
 |---|---|
 | `--color red\|green\|blue\|white\|off` | Apply color to dock and mouse once |
 | `--watch red\|green\|blue\|white\|off` | Hold a color, re-applying it whenever the mouse wakes (runs until stopped) |
+| `--dpi <value>` | Set the mouse DPI (100–35000): one value for both axes, or `XxY` (e.g. `1600x800`) |
 | `--check` | Verify devices are detected and accessible |
 | `--battery` | Report mouse battery percentage and charging status |
 | `--info` | Full device report: serial, firmware, battery, DPI, onboard profile |
@@ -43,9 +45,13 @@ razerd --sniff
 razerd --check
 razerd --color blue
 razerd --battery          # → ✓ Battery: 89%  (or "89% (charging)")
+razerd --dpi 1800         # → ✓ DPI: 1800
+razerd --dpi 1600x800     # separate X/Y axes
 razerd --info
 razerd --color off
 ```
+
+`--dpi` writes to the mouse's persistent slot and reads the value back, so what it prints is what the sensor actually runs at (the firmware may snap the value to its supported steps).
 
 Example `--info` output:
 ```
@@ -180,7 +186,7 @@ The Razer Mouse Dock Pro (`1532:00A4`) exposes three HID interfaces on USB. All 
 | `0x1D` (29) | `0x07` | 8 | Dock LED ring |
 | `0x2C` (44) | `0x0C` | 13 | Basilisk V3 Pro 35K via RF |
 
-Battery queries use command class `0x07` (power): `cmd=0x80` for level, `cmd=0x84` for charging status. Onboard profile queries use class `0x05`: `cmd=0x80` for the slot count, `cmd=0x84` for the active slot. The dock forwards the request over RF and the mouse's reply is read back with `HIDIOCGFEATURE`.
+Battery queries use command class `0x07` (power): `cmd=0x80` for level, `cmd=0x84` for charging status. Onboard profile queries use class `0x05`: `cmd=0x80` for the slot count, `cmd=0x84` for the active slot. DPI uses class `0x04`: `cmd=0x85` reads and `cmd=0x05` writes X/Y as big-endian u16 pairs behind a varstore byte. The dock forwards the request over RF and the mouse's reply is read back with `HIDIOCGFEATURE`.
 
 The protocol was reverse-engineered from USB captures of Razer Synapse on Windows using Wireshark.
 

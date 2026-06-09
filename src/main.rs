@@ -43,8 +43,17 @@ const CLASS_DEVICE: u8 = 0x00;
 const CMD_GET_FIRMWARE: u8 = 0x81;
 const CMD_GET_SERIAL: u8 = 0x82;
 
+// First argument of DPI get/set: which storage slot the value lives in.
+// 0x01 = the persistent slot the firmware actually runs from.
+const VARSTORE: u8 = 0x01;
+
 const CLASS_DPI: u8 = 0x04;
+const CMD_SET_DPI: u8 = 0x05;
 const CMD_GET_DPI: u8 = 0x85;
+
+// Sensor limits of the Basilisk V3 Pro 35K (the "35K" is the max DPI).
+const DPI_MIN: u16 = 100;
+const DPI_MAX: u16 = 35_000;
 
 // Onboard profile slots, cycled with the button under the mouse. The
 // indicator LED next to it shows the active slot's color.
@@ -112,28 +121,32 @@ fn hidioc_get_feature(len: usize) -> u64 {
 #[command(author, version, about)]
 struct Cli {
     /// Verify the dock is detected and accessible.
-    #[arg(long, conflicts_with_all = ["color", "battery", "info", "sniff", "watch"])]
+    #[arg(long, conflicts_with_all = ["color", "battery", "info", "sniff", "watch", "dpi"])]
     check: bool,
 
     /// Apply a color to the dock and the wireless mouse.
-    #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info", "sniff", "watch"])]
+    #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info", "sniff", "watch", "dpi"])]
     color: Option<ColorName>,
 
     /// Print the mouse battery level and charging status.
-    #[arg(long, conflicts_with_all = ["check", "color", "info", "sniff", "watch"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "info", "sniff", "watch", "dpi"])]
     battery: bool,
 
     /// Print a full device report (serial, firmware, battery, DPI, ...).
-    #[arg(long, conflicts_with_all = ["check", "color", "battery", "sniff", "watch"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "battery", "sniff", "watch", "dpi"])]
     info: bool,
 
     /// Dump timestamped HID input reports from the dock (diagnostic).
-    #[arg(long, conflicts_with_all = ["check", "color", "battery", "info", "watch"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "battery", "info", "watch", "dpi"])]
     sniff: bool,
 
     /// Hold a color, re-applying it whenever the mouse wakes (runs until stopped).
-    #[arg(long, value_enum, value_name = "COLOR", conflicts_with_all = ["check", "color", "battery", "info", "sniff"])]
+    #[arg(long, value_enum, value_name = "COLOR", conflicts_with_all = ["check", "color", "battery", "info", "sniff", "dpi"])]
     watch: Option<ColorName>,
+
+    /// Set the mouse DPI: a single value for both axes, or XxY (e.g. 1600x800).
+    #[arg(long, value_parser = parse_dpi, value_name = "DPI", conflicts_with_all = ["check", "color", "battery", "info", "sniff", "watch"])]
+    dpi: Option<Dpi>,
 }
 
 enum Action {
@@ -143,6 +156,7 @@ enum Action {
     Info,
     Sniff,
     Watch(ColorName),
+    Dpi(Dpi),
 }
 
 impl Cli {
@@ -156,6 +170,7 @@ impl Cli {
             self.info.then_some(Action::Info),
             self.sniff.then_some(Action::Sniff),
             self.watch.map(Action::Watch),
+            self.dpi.map(Action::Dpi),
         ]
         .into_iter()
         .flatten();
@@ -163,7 +178,7 @@ impl Cli {
         match (chosen.next(), chosen.next()) {
             (Some(action), None) => Ok(action),
             _ => bail!(
-                "specify exactly one action: --check, --color, --battery, --info, --sniff, or --watch"
+                "specify exactly one action: --check, --color, --battery, --info, --sniff, --watch, or --dpi"
             ),
         }
     }
@@ -198,6 +213,31 @@ impl ColorName {
             Self::Off => "off",
         }
     }
+}
+
+/// Target DPI for `--dpi`: `1800` drives both axes, `1600x800` splits X/Y.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dpi {
+    x: u16,
+    y: u16,
+}
+
+fn parse_dpi(s: &str) -> Result<Dpi, String> {
+    let (x, y) = match s.split_once(['x', 'X']) {
+        Some((x, y)) => (x, y),
+        None => (s, s),
+    };
+    let axis = |v: &str| -> Result<u16, String> {
+        let n: u16 = v.parse().map_err(|_| format!("'{v}' is not a DPI value"))?;
+        if !(DPI_MIN..=DPI_MAX).contains(&n) {
+            return Err(format!("{n} is out of range ({DPI_MIN}-{DPI_MAX})"));
+        }
+        Ok(n)
+    };
+    Ok(Dpi {
+        x: axis(x)?,
+        y: axis(y)?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,20 +641,35 @@ fn query_profiles(dock: &HidrawDevice) -> Result<ProfileInfo> {
 }
 
 fn query_dpi(dock: &HidrawDevice) -> Result<(u16, u16)> {
-    // arg[0] = VARSTORE (0x01); response carries DPI X/Y as big-endian u16 pairs.
+    // Response carries DPI X/Y as big-endian u16 pairs after the varstore byte.
     let resp = dock
         .exchange_feature(&build_query(
             TX_ID_MOUSE,
             CLASS_DPI,
             CMD_GET_DPI,
             0x07,
-            &[0x01],
+            &[VARSTORE],
         ))
         .context("DPI query failed")?;
     Ok((
         u16::from_be_bytes([resp[9], resp[10]]),
         u16::from_be_bytes([resp[11], resp[12]]),
     ))
+}
+
+/// Write DPI X/Y to the persistent slot — same layout as the GET response.
+fn set_dpi(dock: &HidrawDevice, dpi: Dpi) -> Result<()> {
+    let [xh, xl] = dpi.x.to_be_bytes();
+    let [yh, yl] = dpi.y.to_be_bytes();
+    dock.exchange_feature(&build_query(
+        TX_ID_MOUSE,
+        CLASS_DPI,
+        CMD_SET_DPI,
+        0x07,
+        &[VARSTORE, xh, xl, yh, yl],
+    ))
+    .context("DPI set failed")?;
+    Ok(())
 }
 
 // ---------- Actions ----------
@@ -631,7 +686,23 @@ fn main() -> Result<()> {
         Action::Info => run_info(&dock),
         Action::Sniff => run_sniff(&dock),
         Action::Watch(c) => run_watch(&dock, c),
+        Action::Dpi(d) => run_dpi(&dock, d),
     }
+}
+
+/// Set the DPI, then read it back: the firmware may snap or clamp the value,
+/// so what we print is what the sensor actually runs at.
+fn run_dpi(dock: &HidrawDevice, dpi: Dpi) -> Result<()> {
+    set_dpi(dock, dpi)?;
+    let applied = query_dpi(dock).context("DPI readback failed")?;
+    println!("✓ DPI: {}", format_dpi(applied));
+    if applied != (dpi.x, dpi.y) {
+        println!(
+            "⚠ requested {}, firmware adjusted it",
+            format_dpi((dpi.x, dpi.y))
+        );
+    }
+    Ok(())
 }
 
 fn run_check(dock: &HidrawDevice) -> Result<()> {
@@ -928,6 +999,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_dpi_accepts_single_and_xy_forms() {
+        assert_eq!(parse_dpi("1800").unwrap(), Dpi { x: 1800, y: 1800 });
+        assert_eq!(parse_dpi("1600x800").unwrap(), Dpi { x: 1600, y: 800 });
+        assert_eq!(parse_dpi("1600X800").unwrap(), Dpi { x: 1600, y: 800 });
+        assert_eq!(parse_dpi("100").unwrap(), Dpi { x: 100, y: 100 });
+        assert_eq!(parse_dpi("35000").unwrap(), Dpi { x: 35000, y: 35000 });
+    }
+
+    #[test]
+    fn parse_dpi_rejects_out_of_range_and_garbage() {
+        assert!(parse_dpi("99").is_err());
+        assert!(parse_dpi("35001").is_err());
+        assert!(parse_dpi("0").is_err());
+        assert!(parse_dpi("fast").is_err());
+        assert!(parse_dpi("1600x").is_err());
+        assert!(parse_dpi("x800").is_err());
+        assert!(parse_dpi("-100").is_err());
+        assert!(parse_dpi("1600x800x400").is_err());
+    }
+
+    #[test]
+    fn set_dpi_query_layout_is_big_endian_xy() {
+        let q = build_query(
+            TX_ID_MOUSE,
+            CLASS_DPI,
+            CMD_SET_DPI,
+            0x07,
+            &[VARSTORE, 0x07, 0x08, 0x03, 0x20],
+        );
+        assert_eq!(q[1], TX_ID_MOUSE);
+        assert_eq!(q[5], 0x07);
+        assert_eq!(q[6], CLASS_DPI);
+        assert_eq!(q[7], CMD_SET_DPI);
+        // varstore, then X=1800 (0x0708), Y=800 (0x0320), big-endian.
+        assert_eq!(&q[8..13], &[0x01, 0x07, 0x08, 0x03, 0x20]);
+        assert_eq!(q[88], compute_crc(&q));
+    }
+
+    #[test]
     fn profile_info_formats_with_indicator_color() {
         assert_eq!(
             ProfileInfo {
@@ -971,6 +1081,7 @@ mod tests {
             info: false,
             sniff: false,
             watch: None,
+            dpi: None,
         };
         assert!(cli.action().is_err());
 
