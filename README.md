@@ -33,7 +33,7 @@ razerd --sniff
 |---|---|
 | `--color red\|green\|blue\|white\|off` | Apply color to dock and mouse once |
 | `--watch red\|green\|blue\|white\|off` | Hold a color, re-applying it whenever the mouse wakes (runs until stopped) |
-| `--dpi <value>` | Set the mouse DPI (100–35000): one value for both axes, or `XxY` (e.g. `1600x800`) |
+| `--dpi <value>` | Set the mouse DPI (100–35000) |
 | `--check` | Verify devices are detected and accessible |
 | `--battery` | Report mouse battery percentage and charging status |
 | `--info` | Full device report: serial, firmware, battery, DPI, onboard profile |
@@ -46,7 +46,6 @@ razerd --check
 razerd --color blue
 razerd --battery          # → ✓ Battery: 89%  (or "89% (charging)")
 razerd --dpi 1800         # → ✓ DPI: 1800
-razerd --dpi 1600x800     # separate X/Y axes
 razerd --info
 razerd --color off
 ```

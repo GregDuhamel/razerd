@@ -144,9 +144,9 @@ struct Cli {
     #[arg(long, value_enum, value_name = "COLOR", conflicts_with_all = ["check", "color", "battery", "info", "sniff", "dpi"])]
     watch: Option<ColorName>,
 
-    /// Set the mouse DPI: a single value for both axes, or XxY (e.g. 1600x800).
+    /// Set the mouse DPI (applies to both axes).
     #[arg(long, value_parser = parse_dpi, value_name = "DPI", conflicts_with_all = ["check", "color", "battery", "info", "sniff", "watch"])]
-    dpi: Option<Dpi>,
+    dpi: Option<u16>,
 }
 
 enum Action {
@@ -156,7 +156,7 @@ enum Action {
     Info,
     Sniff,
     Watch(ColorName),
-    Dpi(Dpi),
+    Dpi(u16),
 }
 
 impl Cli {
@@ -215,29 +215,12 @@ impl ColorName {
     }
 }
 
-/// Target DPI for `--dpi`: `1800` drives both axes, `1600x800` splits X/Y.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Dpi {
-    x: u16,
-    y: u16,
-}
-
-fn parse_dpi(s: &str) -> Result<Dpi, String> {
-    let (x, y) = match s.split_once(['x', 'X']) {
-        Some((x, y)) => (x, y),
-        None => (s, s),
-    };
-    let axis = |v: &str| -> Result<u16, String> {
-        let n: u16 = v.parse().map_err(|_| format!("'{v}' is not a DPI value"))?;
-        if !(DPI_MIN..=DPI_MAX).contains(&n) {
-            return Err(format!("{n} is out of range ({DPI_MIN}-{DPI_MAX})"));
-        }
-        Ok(n)
-    };
-    Ok(Dpi {
-        x: axis(x)?,
-        y: axis(y)?,
-    })
+fn parse_dpi(s: &str) -> Result<u16, String> {
+    let n: u16 = s.parse().map_err(|_| format!("'{s}' is not a DPI value"))?;
+    if !(DPI_MIN..=DPI_MAX).contains(&n) {
+        return Err(format!("{n} is out of range ({DPI_MIN}-{DPI_MAX})"));
+    }
+    Ok(n)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,16 +640,17 @@ fn query_dpi(dock: &HidrawDevice) -> Result<(u16, u16)> {
     ))
 }
 
-/// Write DPI X/Y to the persistent slot — same layout as the GET response.
-fn set_dpi(dock: &HidrawDevice, dpi: Dpi) -> Result<()> {
-    let [xh, xl] = dpi.x.to_be_bytes();
-    let [yh, yl] = dpi.y.to_be_bytes();
+/// Write the DPI to the persistent slot — the report carries X and Y as
+/// big-endian u16 pairs (same layout as the GET response); we drive both
+/// axes with the same value.
+fn set_dpi(dock: &HidrawDevice, dpi: u16) -> Result<()> {
+    let [hi, lo] = dpi.to_be_bytes();
     dock.exchange_feature(&build_query(
         TX_ID_MOUSE,
         CLASS_DPI,
         CMD_SET_DPI,
         0x07,
-        &[VARSTORE, xh, xl, yh, yl],
+        &[VARSTORE, hi, lo, hi, lo],
     ))
     .context("DPI set failed")?;
     Ok(())
@@ -692,15 +676,12 @@ fn main() -> Result<()> {
 
 /// Set the DPI, then read it back: the firmware may snap or clamp the value,
 /// so what we print is what the sensor actually runs at.
-fn run_dpi(dock: &HidrawDevice, dpi: Dpi) -> Result<()> {
+fn run_dpi(dock: &HidrawDevice, dpi: u16) -> Result<()> {
     set_dpi(dock, dpi)?;
     let applied = query_dpi(dock).context("DPI readback failed")?;
     println!("✓ DPI: {}", format_dpi(applied));
-    if applied != (dpi.x, dpi.y) {
-        println!(
-            "⚠ requested {}, firmware adjusted it",
-            format_dpi((dpi.x, dpi.y))
-        );
+    if applied != (dpi, dpi) {
+        println!("⚠ requested {dpi}, firmware adjusted it");
     }
     Ok(())
 }
@@ -999,12 +980,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_dpi_accepts_single_and_xy_forms() {
-        assert_eq!(parse_dpi("1800").unwrap(), Dpi { x: 1800, y: 1800 });
-        assert_eq!(parse_dpi("1600x800").unwrap(), Dpi { x: 1600, y: 800 });
-        assert_eq!(parse_dpi("1600X800").unwrap(), Dpi { x: 1600, y: 800 });
-        assert_eq!(parse_dpi("100").unwrap(), Dpi { x: 100, y: 100 });
-        assert_eq!(parse_dpi("35000").unwrap(), Dpi { x: 35000, y: 35000 });
+    fn parse_dpi_accepts_in_range_values() {
+        assert_eq!(parse_dpi("1800").unwrap(), 1800);
+        assert_eq!(parse_dpi("100").unwrap(), 100);
+        assert_eq!(parse_dpi("35000").unwrap(), 35000);
     }
 
     #[test]
@@ -1013,27 +992,25 @@ mod tests {
         assert!(parse_dpi("35001").is_err());
         assert!(parse_dpi("0").is_err());
         assert!(parse_dpi("fast").is_err());
-        assert!(parse_dpi("1600x").is_err());
-        assert!(parse_dpi("x800").is_err());
         assert!(parse_dpi("-100").is_err());
-        assert!(parse_dpi("1600x800x400").is_err());
+        assert!(parse_dpi("1600x800").is_err());
     }
 
     #[test]
-    fn set_dpi_query_layout_is_big_endian_xy() {
+    fn set_dpi_query_layout_is_big_endian_both_axes() {
         let q = build_query(
             TX_ID_MOUSE,
             CLASS_DPI,
             CMD_SET_DPI,
             0x07,
-            &[VARSTORE, 0x07, 0x08, 0x03, 0x20],
+            &[VARSTORE, 0x07, 0x08, 0x07, 0x08],
         );
         assert_eq!(q[1], TX_ID_MOUSE);
         assert_eq!(q[5], 0x07);
         assert_eq!(q[6], CLASS_DPI);
         assert_eq!(q[7], CMD_SET_DPI);
-        // varstore, then X=1800 (0x0708), Y=800 (0x0320), big-endian.
-        assert_eq!(&q[8..13], &[0x01, 0x07, 0x08, 0x03, 0x20]);
+        // varstore, then 1800 (0x0708) big-endian on both axes.
+        assert_eq!(&q[8..13], &[0x01, 0x07, 0x08, 0x07, 0x08]);
         assert_eq!(q[88], compute_crc(&q));
     }
 
