@@ -36,7 +36,7 @@ razerd --sniff
 | `--sensitivity-stages on\|off` | `on`: install the 5-stage table (400/800/1600/3200/6400) and enable the Cycle Up Sensitivity Stages button; `off`: freeze the current DPI and disable it |
 | `--check` | Verify devices are detected and accessible |
 | `--battery` | Report mouse battery percentage and charging status |
-| `--info` | Full device report: serial, firmware, battery, DPI, onboard profile |
+| `--info` | Full device report: serial, firmware, battery, DPI, stages lock state, onboard profile |
 | `--sniff` | Diagnostic: dump timestamped HID input reports from the dock (Ctrl-C to stop) |
 
 ### Examples
@@ -76,8 +76,11 @@ Razer Basilisk V3 Pro 35K (via Dock)
   Battery:  89%
   Charging: no
   DPI:      1800
+  Stages:   🔒 off — locked at 1800
   Profile:  4 (blue) of 5
 ```
+
+The `Stages` line is the sensitivity lock indicator: `🔒 off` means the stage table holds a single value and the Cycle Up Sensitivity Stages button is inert; `🔄 on` lists the stages the button cycles, with the active one in brackets (e.g. `400/800/[1600]/3200/6400`).
 
 The mouse stores 5 onboard profiles, cycled with the button on its underside; the indicator LED next to it shows the active slot's color (1 white, 2 red, 3 green, 4 blue, 5 cyan). `--info` reports the active slot.
 
