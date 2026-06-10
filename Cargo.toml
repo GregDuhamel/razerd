@@ -2,8 +2,11 @@
 name = "razerd"
 version = "0.9.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 description = "Minimal Razer RGB daemon for Linux"
+repository = "https://github.com/GregDuhamel/razerd"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"

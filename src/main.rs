@@ -44,10 +44,10 @@ const CMD_GET_FIRMWARE: u8 = 0x81;
 const CMD_GET_SERIAL: u8 = 0x82;
 
 // First argument of DPI get/set: which storage slot to address. The firmware
-// runs from the live (RAM) slot — the Cycle Up Sensitivity Stages button cycles that one — while the
-// stored slot survives sleep and power-cycles. Writes must hit both to be
-// effective now AND persistent; reads of the live slot show what the sensor
-// actually runs at.
+// runs from the live (RAM) slot — the Cycle Up Sensitivity Stages button
+// cycles that one — while the stored slot survives sleep and power-cycles.
+// Writes must hit both to be effective now AND persistent; reads of the live
+// slot show what the sensor actually runs at.
 const LIVESTORE: u8 = 0x00;
 const VARSTORE: u8 = 0x01;
 
@@ -132,41 +132,47 @@ fn hidioc_get_feature(len: usize) -> u64 {
 
 // ---------- CLI ----------
 
+// Every flag belongs to the `action` group: clap enforces "exactly one of
+// these" (required + non-multiple) so the struct needs no pairwise conflict
+// lists and `action()` needs no arity checks.
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
+#[command(group = clap::ArgGroup::new("action").required(true).multiple(false))]
 struct Cli {
     /// Verify the dock is detected and accessible.
-    #[arg(long, conflicts_with_all = ["color", "battery", "info", "sniff", "watch", "sensitivity", "sensitivity_stages"])]
+    #[arg(long, group = "action")]
     check: bool,
 
     /// Apply a color to the dock and the wireless mouse.
-    #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info", "sniff", "watch", "sensitivity", "sensitivity_stages"])]
+    #[arg(long, value_enum, group = "action")]
     color: Option<ColorName>,
 
     /// Print the mouse battery level and charging status.
-    #[arg(long, conflicts_with_all = ["check", "color", "info", "sniff", "watch", "sensitivity", "sensitivity_stages"])]
+    #[arg(long, group = "action")]
     battery: bool,
 
     /// Print a full device report (serial, firmware, battery, DPI, ...).
-    #[arg(long, conflicts_with_all = ["check", "color", "battery", "sniff", "watch", "sensitivity", "sensitivity_stages"])]
+    #[arg(long, group = "action")]
     info: bool,
 
     /// Dump timestamped HID input reports from the dock (diagnostic).
-    #[arg(long, conflicts_with_all = ["check", "color", "battery", "info", "watch", "sensitivity", "sensitivity_stages"])]
+    #[arg(long, group = "action")]
     sniff: bool,
 
     /// Hold a color, re-applying it whenever the mouse wakes (runs until stopped).
-    #[arg(long, value_enum, value_name = "COLOR", conflicts_with_all = ["check", "color", "battery", "info", "sniff", "sensitivity", "sensitivity_stages"])]
+    #[arg(long, value_enum, value_name = "COLOR", group = "action")]
     watch: Option<ColorName>,
 
     /// Set the sensitivity to one fixed DPI value (the free slider): collapses
-    /// the onboard stage table to it, so the Cycle Up Sensitivity Stages button can't change it.
-    #[arg(long, visible_alias = "dpi", value_parser = parse_dpi, value_name = "DPI", conflicts_with_all = ["check", "color", "battery", "info", "sniff", "watch", "sensitivity_stages"])]
+    /// the onboard stage table to it, so the Cycle Up Sensitivity Stages
+    /// button can't change it.
+    #[arg(long, visible_alias = "dpi", value_parser = parse_dpi, value_name = "DPI", group = "action")]
     sensitivity: Option<u16>,
 
     /// on: install the default 5-stage table (400/800/1600/3200/6400) and
-    /// enable the Cycle Up Sensitivity Stages button; off: freeze the current DPI and disable the button.
-    #[arg(long, value_parser = parse_on_off, value_name = "on|off", conflicts_with_all = ["check", "color", "battery", "info", "sniff", "watch", "sensitivity"])]
+    /// enable the Cycle Up Sensitivity Stages button; off: freeze the current
+    /// DPI and disable the button.
+    #[arg(long, value_parser = clap::builder::BoolishValueParser::new(), value_name = "on|off", group = "action")]
     sensitivity_stages: Option<bool>,
 }
 
@@ -182,10 +188,8 @@ enum Action {
 }
 
 impl Cli {
-    fn action(&self) -> Result<Action> {
-        // clap already enforces mutual exclusion; this maps the one set flag to
-        // its action and rejects the "no action given" case.
-        let mut chosen = [
+    fn action(&self) -> Action {
+        [
             self.check.then_some(Action::Check),
             self.color.map(Action::Color),
             self.battery.then_some(Action::Battery),
@@ -196,14 +200,9 @@ impl Cli {
             self.sensitivity_stages.map(Action::SensitivityStages),
         ]
         .into_iter()
-        .flatten();
-
-        match (chosen.next(), chosen.next()) {
-            (Some(action), None) => Ok(action),
-            _ => bail!(
-                "specify exactly one action: --check, --color, --battery, --info, --sniff, --watch, --sensitivity, or --sensitivity-stages"
-            ),
-        }
+        .flatten()
+        .next()
+        .expect("clap's `action` group guarantees exactly one flag is set")
     }
 }
 
@@ -235,14 +234,6 @@ impl ColorName {
             Self::White => "white",
             Self::Off => "off",
         }
-    }
-}
-
-fn parse_on_off(s: &str) -> Result<bool, String> {
-    match s {
-        "on" | "true" => Ok(true),
-        "off" | "false" => Ok(false),
-        _ => Err(format!("'{s}' is not 'on' or 'off'")),
     }
 }
 
@@ -338,9 +329,10 @@ impl HidrawDevice {
     /// Block until the device emits an input report, returning its length.
     ///
     /// Unlike feature reports (which we pull on demand via ioctl), hidraw
-    /// delivers the device's spontaneous input reports through `read()`. The
-    /// dock uses these to announce events such as the RF mouse connecting or
-    /// disconnecting — which is exactly what `--sniff` is here to surface.
+    /// delivers the device's spontaneous input reports through `read()`. On
+    /// this dock those are plain mouse-motion packets — there is no dedicated
+    /// wake/sleep event — so `--watch` and `--sniff` use their mere presence
+    /// (input flowing vs. silence) as the signal.
     fn read_input_report(&self, buf: &mut [u8]) -> Result<usize> {
         use std::io::Read;
         (&self.file)
@@ -357,6 +349,18 @@ impl HidrawDevice {
         loop {
             std::thread::sleep(RESPONSE_POLL_INTERVAL);
             let response = self.get_feature()?;
+
+            // The firmware echoes data_size/class/cmd (bytes 5..8) in its
+            // response. A mismatch means we read someone else's transaction —
+            // e.g. a concurrent `razerd --watch` re-applying the color — so
+            // treat it like a pending read and keep polling for our own.
+            if response[5..8] != request[5..8] {
+                if Instant::now() < deadline {
+                    continue;
+                }
+                bail!("response belongs to another request (is another razerd instance running?)");
+            }
+
             match classify_response_status(response[0]) {
                 ResponseStatus::Ready => return Ok(response),
                 ResponseStatus::Pending if Instant::now() < deadline => continue,
@@ -554,7 +558,7 @@ fn query_battery(dock: &HidrawDevice) -> Result<BatteryStatus> {
     })
 }
 
-/// Razer reports battery as 0..=255; scale to 0..=100 saturating.
+/// Razer reports battery as 0..=255; rescale to 0..=100 (truncating).
 fn parse_battery_percent(raw: u8) -> u8 {
     ((raw as u32 * 100) / 255) as u8
 }
@@ -675,6 +679,12 @@ fn query_dpi(dock: &HidrawDevice) -> Result<(u16, u16)> {
 /// Write the DPI to the live and stored slots — the report carries X and Y as
 /// big-endian u16 pairs (same layout as the GET response); we drive both axes
 /// with the same value.
+/// "live" / "stored" for error messages, so a failure between the two writes
+/// says which slot was left untouched.
+fn slot_name(store: u8) -> &'static str {
+    if store == LIVESTORE { "live" } else { "stored" }
+}
+
 fn set_dpi(dock: &HidrawDevice, dpi: u16) -> Result<()> {
     let [hi, lo] = dpi.to_be_bytes();
     for store in [LIVESTORE, VARSTORE] {
@@ -685,13 +695,13 @@ fn set_dpi(dock: &HidrawDevice, dpi: u16) -> Result<()> {
             0x07,
             &[store, hi, lo, hi, lo],
         ))
-        .context("DPI set failed")?;
+        .with_context(|| format!("DPI set failed ({} slot)", slot_name(store)))?;
     }
     Ok(())
 }
 
-/// Write the onboard stage table (the one the Cycle Up Sensitivity Stages button cycles) to both the
-/// live and stored slots.
+/// Write the onboard stage table (the one the Cycle Up Sensitivity Stages
+/// button cycles) to both the live and stored slots.
 fn set_dpi_stages(dock: &HidrawDevice, active: u8, stages: &[u16]) -> Result<()> {
     for store in [LIVESTORE, VARSTORE] {
         dock.exchange_feature(&build_query(
@@ -701,7 +711,7 @@ fn set_dpi_stages(dock: &HidrawDevice, active: u8, stages: &[u16]) -> Result<()>
             DPI_STAGES_DATA_SIZE,
             &dpi_stages_args(store, active, stages),
         ))
-        .context("DPI stage table write failed")?;
+        .with_context(|| format!("DPI stage table write failed ({} slot)", slot_name(store)))?;
     }
     Ok(())
 }
@@ -721,7 +731,7 @@ fn dpi_stages_args(store: u8, active: u8, stages: &[u16]) -> Vec<u8> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let action = cli.action()?;
+    let action = cli.action();
     let dock = HidrawDevice::open_dock()?;
 
     match action {
@@ -737,8 +747,8 @@ fn main() -> Result<()> {
 }
 
 /// The free slider: pin the sensitivity to one DPI value and collapse the
-/// stage table to it, so the Cycle Up Sensitivity Stages button is inert — nothing on the mouse can
-/// change the value anymore.
+/// stage table to it, so the Cycle Up Sensitivity Stages button is inert —
+/// nothing on the mouse can change the value anymore.
 fn run_sensitivity(dock: &HidrawDevice, dpi: u16) -> Result<()> {
     set_dpi_stages(dock, 1, &[dpi])?;
     set_dpi(dock, dpi)?;
@@ -754,8 +764,8 @@ fn run_sensitivity(dock: &HidrawDevice, dpi: u16) -> Result<()> {
 }
 
 /// The Synapse-style "Sensitivity Stages" toggle. On: install the default
-/// stage table and give the Cycle Up Sensitivity Stages button its stages back. Off: freeze the
-/// current DPI as the only stage, disabling the button.
+/// stage table and give the Cycle Up Sensitivity Stages button its stages
+/// back. Off: freeze the current DPI as the only stage, disabling the button.
 fn run_sensitivity_stages(dock: &HidrawDevice, enabled: bool) -> Result<()> {
     if enabled {
         let active = DEFAULT_DPI_STAGES[DEFAULT_DPI_ACTIVE_STAGE as usize - 1];
@@ -770,7 +780,10 @@ fn run_sensitivity_stages(dock: &HidrawDevice, enabled: bool) -> Result<()> {
         );
     } else {
         // Freeze whatever the sensor currently runs at.
-        let (x, _) = query_dpi(dock).context("DPI query failed")?;
+        let (x, y) = query_dpi(dock).context("DPI query failed")?;
+        if x != y {
+            println!("⚠ axes differ ({x} / {y}) — freezing both at {x}");
+        }
         run_sensitivity(dock, x)?;
     }
     Ok(())
@@ -1070,16 +1083,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_on_off_maps_to_bool() {
-        assert!(parse_on_off("on").unwrap());
-        assert!(!parse_on_off("off").unwrap());
-        assert!(parse_on_off("true").unwrap());
-        assert!(!parse_on_off("false").unwrap());
-        assert!(parse_on_off("yes").is_err());
-        assert!(parse_on_off("ON").is_err());
-    }
-
-    #[test]
     fn parse_dpi_accepts_in_range_values() {
         assert_eq!(parse_dpi("1800").unwrap(), 1800);
         assert_eq!(parse_dpi("100").unwrap(), 100);
@@ -1187,27 +1190,47 @@ mod tests {
     }
 
     #[test]
-    fn cli_action_requires_exactly_one_flag() {
-        let mut cli = Cli {
-            check: false,
-            color: None,
-            battery: false,
-            info: false,
-            sniff: false,
-            watch: None,
-            sensitivity: None,
-            sensitivity_stages: None,
-        };
-        assert!(cli.action().is_err());
+    fn cli_requires_exactly_one_action_flag() {
+        // Zero flags, two booleans, two valued flags: all rejected by clap.
+        assert!(Cli::try_parse_from(["razerd"]).is_err());
+        assert!(Cli::try_parse_from(["razerd", "--check", "--battery"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "razerd",
+                "--sensitivity",
+                "1800",
+                "--sensitivity-stages",
+                "on"
+            ])
+            .is_err()
+        );
+    }
 
-        cli.check = true;
-        assert!(matches!(cli.action().unwrap(), Action::Check));
-
-        cli.check = false;
-        cli.color = Some(ColorName::Blue);
+    #[test]
+    fn cli_maps_flags_to_actions() {
+        let action = |args: &[&str]| Cli::try_parse_from(args).unwrap().action();
+        assert!(matches!(action(&["razerd", "--check"]), Action::Check));
         assert!(matches!(
-            cli.action().unwrap(),
+            action(&["razerd", "--color", "blue"]),
             Action::Color(ColorName::Blue)
+        ));
+        assert!(matches!(
+            action(&["razerd", "--sensitivity", "1800"]),
+            Action::Sensitivity(1800)
+        ));
+        // --dpi is a visible alias of --sensitivity.
+        assert!(matches!(
+            action(&["razerd", "--dpi", "1800"]),
+            Action::Sensitivity(1800)
+        ));
+        assert!(matches!(
+            action(&["razerd", "--sensitivity-stages", "on"]),
+            Action::SensitivityStages(true)
+        ));
+        // BoolishValueParser also takes off/false/no, case-insensitively.
+        assert!(matches!(
+            action(&["razerd", "--sensitivity-stages", "OFF"]),
+            Action::SensitivityStages(false)
         ));
     }
 
