@@ -20,7 +20,8 @@ When the mouse is connected wirelessly through the dock, razerd sends a single c
 ```
 razerd --color <COLOR>
 razerd --watch <COLOR>
-razerd --dpi <DPI>
+razerd --sensitivity <DPI>
+razerd --sensitivity-stages <on|off>
 razerd --check
 razerd --battery
 razerd --info
@@ -33,7 +34,8 @@ razerd --sniff
 |---|---|
 | `--color red\|green\|blue\|white\|off` | Apply color to dock and mouse once |
 | `--watch red\|green\|blue\|white\|off` | Hold a color, re-applying it whenever the mouse wakes (runs until stopped) |
-| `--dpi <value>` | Set the mouse DPI (100–35000) |
+| `--sensitivity <value>` (alias `--dpi`) | Set the sensitivity to one fixed DPI value (100–35000), disabling the Cycle Up Sensitivity Stages button |
+| `--sensitivity-stages on\|off` | `on`: install the 5-stage table (400/800/1600/3200/6400) and enable the Cycle Up Sensitivity Stages button; `off`: freeze the current DPI and disable it |
 | `--check` | Verify devices are detected and accessible |
 | `--battery` | Report mouse battery percentage and charging status |
 | `--info` | Full device report: serial, firmware, battery, DPI, onboard profile |
@@ -45,12 +47,22 @@ razerd --sniff
 razerd --check
 razerd --color blue
 razerd --battery          # → ✓ Battery: 89%  (or "89% (charging)")
-razerd --dpi 1800         # → ✓ DPI: 1800
+razerd --sensitivity 1800        # → ✓ DPI: 1800 (stages off — Cycle Up Sensitivity Stages button disabled)
+razerd --dpi 1800                # same thing (alias)
+razerd --sensitivity-stages on   # → ✓ DPI: 1600 (stages on — Cycle Up Sensitivity Stages button cycles 400/800/1600/3200/6400)
+razerd --sensitivity-stages off  # freeze the current DPI, disable the button
 razerd --info
 razerd --color off
 ```
 
-`--dpi` writes to the mouse's persistent slot and reads the value back, so what it prints is what the sensor actually runs at (the firmware may snap the value to its supported steps).
+### Sensitivity: `--sensitivity` and `--sensitivity-stages`
+
+Modeled on Synapse's *Sensitivity* panel. The Cycle Up Sensitivity Stages button behind the scroll wheel cycles an onboard table of up to 5 stages, so a stray press can silently change your sensitivity.
+
+- `--sensitivity <value>` (alias `--dpi`) is the free slider: it pins one DPI value by collapsing the stage table to a single entry — the button has nothing to cycle to and becomes inert.
+- `--sensitivity-stages on` installs the 5-stage table (400/800/1600/3200/6400, 1600 active — the firmware caps the table at 5 stages) and gives the button its stages back; `off` freezes whatever DPI is currently active and disables the button.
+
+All writes hit the live slot *and* the persistent slot (so the change applies immediately and survives sleep), then read the result back — what they print is what the sensor actually runs at.
 
 Example `--info` output:
 ```
@@ -185,7 +197,7 @@ The Razer Mouse Dock Pro (`1532:00A4`) exposes three HID interfaces on USB. All 
 | `0x1D` (29) | `0x07` | 8 | Dock LED ring |
 | `0x2C` (44) | `0x0C` | 13 | Basilisk V3 Pro 35K via RF |
 
-Battery queries use command class `0x07` (power): `cmd=0x80` for level, `cmd=0x84` for charging status. Onboard profile queries use class `0x05`: `cmd=0x80` for the slot count, `cmd=0x84` for the active slot. DPI uses class `0x04`: `cmd=0x85` reads and `cmd=0x05` writes X/Y as big-endian u16 pairs behind a varstore byte. The dock forwards the request over RF and the mouse's reply is read back with `HIDIOCGFEATURE`.
+Battery queries use command class `0x07` (power): `cmd=0x80` for level, `cmd=0x84` for charging status. Onboard profile queries use class `0x05`: `cmd=0x80` for the slot count, `cmd=0x84` for the active slot. DPI uses class `0x04`: `cmd=0x85` reads and `cmd=0x05` writes X/Y as big-endian u16 pairs behind a storage-slot byte (`0x00` = live/RAM — what the sensor runs at and what the Cycle Up Sensitivity Stages button updates; `0x01` = persistent). The Cycle Up Sensitivity Stages button's stage table is `cmd=0x86`/`0x06`: active stage, stage count, then up to 5 × (index, X, Y, 2 reserved); `--sensitivity` writes it with a single stage. The dock forwards the request over RF and the mouse's reply is read back with `HIDIOCGFEATURE`.
 
 The protocol was reverse-engineered from USB captures of Razer Synapse on Windows using Wireshark.
 
