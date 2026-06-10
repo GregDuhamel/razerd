@@ -43,8 +43,32 @@ const CLASS_DEVICE: u8 = 0x00;
 const CMD_GET_FIRMWARE: u8 = 0x81;
 const CMD_GET_SERIAL: u8 = 0x82;
 
+// First argument of DPI get/set: which storage slot to address. The firmware
+// runs from the live (RAM) slot — the Cycle Up Sensitivity Stages button cycles that one — while the
+// stored slot survives sleep and power-cycles. Writes must hit both to be
+// effective now AND persistent; reads of the live slot show what the sensor
+// actually runs at.
+const LIVESTORE: u8 = 0x00;
+const VARSTORE: u8 = 0x01;
+
 const CLASS_DPI: u8 = 0x04;
+const CMD_SET_DPI: u8 = 0x05;
 const CMD_GET_DPI: u8 = 0x85;
+const CMD_SET_DPI_STAGES: u8 = 0x06;
+
+// Stage table layout: [store, active_stage (1-based), count] then per stage
+// 7 bytes: index, X hi/lo, Y hi/lo, 2 reserved. 3 + 5*7 = 38 = 0x26.
+const DPI_STAGES_DATA_SIZE: u8 = 0x26;
+
+// The stage table `--sensitivity-stages on` installs — Synapse's defaults for
+// "Cycle Up Sensitivity Stages", stage 3 (1600) active. The firmware caps the
+// table at 5 stages: a 6th is rejected with status 0x03.
+const DEFAULT_DPI_STAGES: [u16; 5] = [400, 800, 1600, 3200, 6400];
+const DEFAULT_DPI_ACTIVE_STAGE: u8 = 3;
+
+// Sensor limits of the Basilisk V3 Pro 35K (the "35K" is the max DPI).
+const DPI_MIN: u16 = 100;
+const DPI_MAX: u16 = 35_000;
 
 // Onboard profile slots, cycled with the button under the mouse. The
 // indicator LED next to it shows the active slot's color.
@@ -112,28 +136,38 @@ fn hidioc_get_feature(len: usize) -> u64 {
 #[command(author, version, about)]
 struct Cli {
     /// Verify the dock is detected and accessible.
-    #[arg(long, conflicts_with_all = ["color", "battery", "info", "sniff", "watch"])]
+    #[arg(long, conflicts_with_all = ["color", "battery", "info", "sniff", "watch", "sensitivity", "sensitivity_stages"])]
     check: bool,
 
     /// Apply a color to the dock and the wireless mouse.
-    #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info", "sniff", "watch"])]
+    #[arg(long, value_enum, conflicts_with_all = ["check", "battery", "info", "sniff", "watch", "sensitivity", "sensitivity_stages"])]
     color: Option<ColorName>,
 
     /// Print the mouse battery level and charging status.
-    #[arg(long, conflicts_with_all = ["check", "color", "info", "sniff", "watch"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "info", "sniff", "watch", "sensitivity", "sensitivity_stages"])]
     battery: bool,
 
     /// Print a full device report (serial, firmware, battery, DPI, ...).
-    #[arg(long, conflicts_with_all = ["check", "color", "battery", "sniff", "watch"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "battery", "sniff", "watch", "sensitivity", "sensitivity_stages"])]
     info: bool,
 
     /// Dump timestamped HID input reports from the dock (diagnostic).
-    #[arg(long, conflicts_with_all = ["check", "color", "battery", "info", "watch"])]
+    #[arg(long, conflicts_with_all = ["check", "color", "battery", "info", "watch", "sensitivity", "sensitivity_stages"])]
     sniff: bool,
 
     /// Hold a color, re-applying it whenever the mouse wakes (runs until stopped).
-    #[arg(long, value_enum, value_name = "COLOR", conflicts_with_all = ["check", "color", "battery", "info", "sniff"])]
+    #[arg(long, value_enum, value_name = "COLOR", conflicts_with_all = ["check", "color", "battery", "info", "sniff", "sensitivity", "sensitivity_stages"])]
     watch: Option<ColorName>,
+
+    /// Set the sensitivity to one fixed DPI value (the free slider): collapses
+    /// the onboard stage table to it, so the Cycle Up Sensitivity Stages button can't change it.
+    #[arg(long, visible_alias = "dpi", value_parser = parse_dpi, value_name = "DPI", conflicts_with_all = ["check", "color", "battery", "info", "sniff", "watch", "sensitivity_stages"])]
+    sensitivity: Option<u16>,
+
+    /// on: install the default 5-stage table (400/800/1600/3200/6400) and
+    /// enable the Cycle Up Sensitivity Stages button; off: freeze the current DPI and disable the button.
+    #[arg(long, value_parser = parse_on_off, value_name = "on|off", conflicts_with_all = ["check", "color", "battery", "info", "sniff", "watch", "sensitivity"])]
+    sensitivity_stages: Option<bool>,
 }
 
 enum Action {
@@ -143,6 +177,8 @@ enum Action {
     Info,
     Sniff,
     Watch(ColorName),
+    Sensitivity(u16),
+    SensitivityStages(bool),
 }
 
 impl Cli {
@@ -156,6 +192,8 @@ impl Cli {
             self.info.then_some(Action::Info),
             self.sniff.then_some(Action::Sniff),
             self.watch.map(Action::Watch),
+            self.sensitivity.map(Action::Sensitivity),
+            self.sensitivity_stages.map(Action::SensitivityStages),
         ]
         .into_iter()
         .flatten();
@@ -163,7 +201,7 @@ impl Cli {
         match (chosen.next(), chosen.next()) {
             (Some(action), None) => Ok(action),
             _ => bail!(
-                "specify exactly one action: --check, --color, --battery, --info, --sniff, or --watch"
+                "specify exactly one action: --check, --color, --battery, --info, --sniff, --watch, --sensitivity, or --sensitivity-stages"
             ),
         }
     }
@@ -198,6 +236,22 @@ impl ColorName {
             Self::Off => "off",
         }
     }
+}
+
+fn parse_on_off(s: &str) -> Result<bool, String> {
+    match s {
+        "on" | "true" => Ok(true),
+        "off" | "false" => Ok(false),
+        _ => Err(format!("'{s}' is not 'on' or 'off'")),
+    }
+}
+
+fn parse_dpi(s: &str) -> Result<u16, String> {
+    let n: u16 = s.parse().map_err(|_| format!("'{s}' is not a DPI value"))?;
+    if !(DPI_MIN..=DPI_MAX).contains(&n) {
+        return Err(format!("{n} is out of range ({DPI_MIN}-{DPI_MAX})"));
+    }
+    Ok(n)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,20 +655,66 @@ fn query_profiles(dock: &HidrawDevice) -> Result<ProfileInfo> {
 }
 
 fn query_dpi(dock: &HidrawDevice) -> Result<(u16, u16)> {
-    // arg[0] = VARSTORE (0x01); response carries DPI X/Y as big-endian u16 pairs.
+    // Read the live slot: it reflects DPI-button presses, the stored slot
+    // doesn't. Response carries X/Y as big-endian u16 pairs after the store byte.
     let resp = dock
         .exchange_feature(&build_query(
             TX_ID_MOUSE,
             CLASS_DPI,
             CMD_GET_DPI,
             0x07,
-            &[0x01],
+            &[LIVESTORE],
         ))
         .context("DPI query failed")?;
     Ok((
         u16::from_be_bytes([resp[9], resp[10]]),
         u16::from_be_bytes([resp[11], resp[12]]),
     ))
+}
+
+/// Write the DPI to the live and stored slots — the report carries X and Y as
+/// big-endian u16 pairs (same layout as the GET response); we drive both axes
+/// with the same value.
+fn set_dpi(dock: &HidrawDevice, dpi: u16) -> Result<()> {
+    let [hi, lo] = dpi.to_be_bytes();
+    for store in [LIVESTORE, VARSTORE] {
+        dock.exchange_feature(&build_query(
+            TX_ID_MOUSE,
+            CLASS_DPI,
+            CMD_SET_DPI,
+            0x07,
+            &[store, hi, lo, hi, lo],
+        ))
+        .context("DPI set failed")?;
+    }
+    Ok(())
+}
+
+/// Write the onboard stage table (the one the Cycle Up Sensitivity Stages button cycles) to both the
+/// live and stored slots.
+fn set_dpi_stages(dock: &HidrawDevice, active: u8, stages: &[u16]) -> Result<()> {
+    for store in [LIVESTORE, VARSTORE] {
+        dock.exchange_feature(&build_query(
+            TX_ID_MOUSE,
+            CLASS_DPI,
+            CMD_SET_DPI_STAGES,
+            DPI_STAGES_DATA_SIZE,
+            &dpi_stages_args(store, active, stages),
+        ))
+        .context("DPI stage table write failed")?;
+    }
+    Ok(())
+}
+
+/// `[store, active_stage, count]`, then 7 bytes per stage: 1-based index,
+/// X and Y big-endian (same value on both axes), two reserved zero bytes.
+fn dpi_stages_args(store: u8, active: u8, stages: &[u16]) -> Vec<u8> {
+    let mut args = vec![store, active, stages.len() as u8];
+    for (i, dpi) in stages.iter().enumerate() {
+        let [hi, lo] = dpi.to_be_bytes();
+        args.extend_from_slice(&[(i + 1) as u8, hi, lo, hi, lo, 0x00, 0x00]);
+    }
+    args
 }
 
 // ---------- Actions ----------
@@ -631,7 +731,49 @@ fn main() -> Result<()> {
         Action::Info => run_info(&dock),
         Action::Sniff => run_sniff(&dock),
         Action::Watch(c) => run_watch(&dock, c),
+        Action::Sensitivity(d) => run_sensitivity(&dock, d),
+        Action::SensitivityStages(on) => run_sensitivity_stages(&dock, on),
     }
+}
+
+/// The free slider: pin the sensitivity to one DPI value and collapse the
+/// stage table to it, so the Cycle Up Sensitivity Stages button is inert — nothing on the mouse can
+/// change the value anymore.
+fn run_sensitivity(dock: &HidrawDevice, dpi: u16) -> Result<()> {
+    set_dpi_stages(dock, 1, &[dpi])?;
+    set_dpi(dock, dpi)?;
+    let applied = query_dpi(dock).context("DPI readback failed")?;
+    println!(
+        "✓ DPI: {} (stages off — Cycle Up Sensitivity Stages button disabled)",
+        format_dpi(applied)
+    );
+    if applied != (dpi, dpi) {
+        println!("⚠ requested {dpi}, firmware adjusted it");
+    }
+    Ok(())
+}
+
+/// The Synapse-style "Sensitivity Stages" toggle. On: install the default
+/// stage table and give the Cycle Up Sensitivity Stages button its stages back. Off: freeze the
+/// current DPI as the only stage, disabling the button.
+fn run_sensitivity_stages(dock: &HidrawDevice, enabled: bool) -> Result<()> {
+    if enabled {
+        let active = DEFAULT_DPI_STAGES[DEFAULT_DPI_ACTIVE_STAGE as usize - 1];
+        set_dpi_stages(dock, DEFAULT_DPI_ACTIVE_STAGE, &DEFAULT_DPI_STAGES)?;
+        set_dpi(dock, active)?;
+        let applied = query_dpi(dock).context("DPI readback failed")?;
+        let stages: Vec<String> = DEFAULT_DPI_STAGES.iter().map(u16::to_string).collect();
+        println!(
+            "✓ DPI: {} (stages on — Cycle Up Sensitivity Stages button cycles {})",
+            format_dpi(applied),
+            stages.join("/")
+        );
+    } else {
+        // Freeze whatever the sensor currently runs at.
+        let (x, _) = query_dpi(dock).context("DPI query failed")?;
+        run_sensitivity(dock, x)?;
+    }
+    Ok(())
 }
 
 fn run_check(dock: &HidrawDevice) -> Result<()> {
@@ -928,6 +1070,88 @@ mod tests {
     }
 
     #[test]
+    fn parse_on_off_maps_to_bool() {
+        assert!(parse_on_off("on").unwrap());
+        assert!(!parse_on_off("off").unwrap());
+        assert!(parse_on_off("true").unwrap());
+        assert!(!parse_on_off("false").unwrap());
+        assert!(parse_on_off("yes").is_err());
+        assert!(parse_on_off("ON").is_err());
+    }
+
+    #[test]
+    fn parse_dpi_accepts_in_range_values() {
+        assert_eq!(parse_dpi("1800").unwrap(), 1800);
+        assert_eq!(parse_dpi("100").unwrap(), 100);
+        assert_eq!(parse_dpi("35000").unwrap(), 35000);
+    }
+
+    #[test]
+    fn parse_dpi_rejects_out_of_range_and_garbage() {
+        assert!(parse_dpi("99").is_err());
+        assert!(parse_dpi("35001").is_err());
+        assert!(parse_dpi("0").is_err());
+        assert!(parse_dpi("fast").is_err());
+        assert!(parse_dpi("-100").is_err());
+        assert!(parse_dpi("1600x800").is_err());
+    }
+
+    #[test]
+    fn set_dpi_query_layout_is_big_endian_both_axes() {
+        let q = build_query(
+            TX_ID_MOUSE,
+            CLASS_DPI,
+            CMD_SET_DPI,
+            0x07,
+            &[VARSTORE, 0x07, 0x08, 0x07, 0x08],
+        );
+        assert_eq!(q[1], TX_ID_MOUSE);
+        assert_eq!(q[5], 0x07);
+        assert_eq!(q[6], CLASS_DPI);
+        assert_eq!(q[7], CMD_SET_DPI);
+        // varstore, then 1800 (0x0708) big-endian on both axes.
+        assert_eq!(&q[8..13], &[0x01, 0x07, 0x08, 0x07, 0x08]);
+        assert_eq!(q[88], compute_crc(&q));
+    }
+
+    #[test]
+    fn lock_collapses_stage_table_to_one_entry() {
+        // 1800 (0x0708) as the only stage: store, active=1, count=1, then
+        // stage index 1 with X/Y big-endian and two reserved bytes.
+        let args = dpi_stages_args(VARSTORE, 1, &[1800]);
+        assert_eq!(
+            args,
+            vec![0x01, 0x01, 0x01, 0x01, 0x07, 0x08, 0x07, 0x08, 0x00, 0x00]
+        );
+
+        let q = build_query(
+            TX_ID_MOUSE,
+            CLASS_DPI,
+            CMD_SET_DPI_STAGES,
+            DPI_STAGES_DATA_SIZE,
+            &args,
+        );
+        assert_eq!(q[5], 0x26);
+        assert_eq!(q[6], CLASS_DPI);
+        assert_eq!(q[7], CMD_SET_DPI_STAGES);
+        assert_eq!(q[88], compute_crc(&q));
+    }
+
+    #[test]
+    fn unlock_writes_the_default_stage_table() {
+        let args = dpi_stages_args(LIVESTORE, DEFAULT_DPI_ACTIVE_STAGE, &DEFAULT_DPI_STAGES);
+        assert_eq!(args.len(), DPI_STAGES_DATA_SIZE as usize);
+        assert_eq!(&args[..3], &[0x00, 3, 5]); // live slot, stage 3 of 5 active
+        // Stage 3 entry: index 3, 1600 (0x0640) on both axes.
+        assert_eq!(
+            &args[3 + 2 * 7..3 + 3 * 7],
+            &[3, 0x06, 0x40, 0x06, 0x40, 0, 0]
+        );
+        // Stage 5 entry: index 5, 6400 (0x1900).
+        assert_eq!(&args[3 + 4 * 7..], &[5, 0x19, 0x00, 0x19, 0x00, 0, 0]);
+    }
+
+    #[test]
     fn profile_info_formats_with_indicator_color() {
         assert_eq!(
             ProfileInfo {
@@ -971,6 +1195,8 @@ mod tests {
             info: false,
             sniff: false,
             watch: None,
+            sensitivity: None,
+            sensitivity_stages: None,
         };
         assert!(cli.action().is_err());
 
