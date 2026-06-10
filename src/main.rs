@@ -55,6 +55,7 @@ const CLASS_DPI: u8 = 0x04;
 const CMD_SET_DPI: u8 = 0x05;
 const CMD_GET_DPI: u8 = 0x85;
 const CMD_SET_DPI_STAGES: u8 = 0x06;
+const CMD_GET_DPI_STAGES: u8 = 0x86;
 
 // Stage table layout: [store, active_stage (1-based), count] then per stage
 // 7 bytes: index, X hi/lo, Y hi/lo, 2 reserved. 3 + 5*7 = 38 = 0x26.
@@ -679,6 +680,67 @@ fn query_dpi(dock: &HidrawDevice) -> Result<(u16, u16)> {
 /// Write the DPI to the live and stored slots — the report carries X and Y as
 /// big-endian u16 pairs (same layout as the GET response); we drive both axes
 /// with the same value.
+/// Onboard stage table state, shown by `--info` as the lock indicator: one
+/// stage means the sensitivity is pinned (the Cycle Up Sensitivity Stages
+/// button has nothing to cycle to), several mean the button is live.
+struct DpiStages {
+    active: u8,
+    stages: Vec<u16>,
+}
+
+impl std::fmt::Display for DpiStages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.stages[..] {
+            [] => return f.write_str("—"), // defensive: a garbled table
+            [only] => return write!(f, "🔒 off — locked at {only}"),
+            _ => {}
+        }
+        // Not the open-padlock glyph: it is indistinguishable from 🔒 in
+        // some terminal fonts. The cycle arrows say what the button does.
+        write!(f, "🔄 on — ")?;
+        for (i, dpi) in self.stages.iter().enumerate() {
+            if i > 0 {
+                f.write_str("/")?;
+            }
+            if (i + 1) as u8 == self.active {
+                write!(f, "[{dpi}]")?;
+            } else {
+                write!(f, "{dpi}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse a GET stage-table response: after the status header the args are
+/// `[store, active_stage, count]` then per stage `[index, X be, Y be, 2
+/// reserved]` — the mirror of `dpi_stages_args`.
+fn parse_dpi_stages(resp: &[u8; REPORT_LEN]) -> DpiStages {
+    let active = resp[9];
+    let count = (resp[10] as usize).min(DEFAULT_DPI_STAGES.len());
+    let stages = (0..count)
+        .map(|i| {
+            let entry = 11 + i * 7;
+            u16::from_be_bytes([resp[entry + 1], resp[entry + 2]])
+        })
+        .collect();
+    DpiStages { active, stages }
+}
+
+fn query_dpi_stages(dock: &HidrawDevice) -> Result<DpiStages> {
+    // Live slot: the table the button actually cycles.
+    let resp = dock
+        .exchange_feature(&build_query(
+            TX_ID_MOUSE,
+            CLASS_DPI,
+            CMD_GET_DPI_STAGES,
+            DPI_STAGES_DATA_SIZE,
+            &[LIVESTORE],
+        ))
+        .context("DPI stage table query failed")?;
+    Ok(parse_dpi_stages(&resp))
+}
+
 /// "live" / "stored" for error messages, so a failure between the two writes
 /// says which slot was left untouched.
 fn slot_name(store: u8) -> &'static str {
@@ -945,6 +1007,7 @@ fn run_info(dock: &HidrawDevice) -> Result<()> {
         Err(_) => println!("  Battery:  —"),
     }
     print_field("DPI", query_dpi(dock).ok().map(format_dpi));
+    print_field("Stages", query_dpi_stages(dock).ok());
     print_field("Profile", query_profiles(dock).ok());
 
     Ok(())
@@ -1152,6 +1215,35 @@ mod tests {
         );
         // Stage 5 entry: index 5, 6400 (0x1900).
         assert_eq!(&args[3 + 4 * 7..], &[5, 0x19, 0x00, 0x19, 0x00, 0, 0]);
+    }
+
+    #[test]
+    fn dpi_stages_display_shows_lock_state() {
+        let locked = DpiStages {
+            active: 1,
+            stages: vec![1800],
+        };
+        assert_eq!(locked.to_string(), "🔒 off — locked at 1800");
+
+        let unlocked = DpiStages {
+            active: 3,
+            stages: vec![400, 800, 1600, 3200, 6400],
+        };
+        assert_eq!(unlocked.to_string(), "🔄 on — 400/800/[1600]/3200/6400");
+    }
+
+    #[test]
+    fn parse_dpi_stages_mirrors_the_args_layout() {
+        // Round-trip: a response whose args are exactly what we would write.
+        let mut resp = [0u8; REPORT_LEN];
+        resp[8..8 + 3 + 2 * 7].copy_from_slice(&dpi_stages_args(LIVESTORE, 2, &[400, 800]));
+        let parsed = parse_dpi_stages(&resp);
+        assert_eq!(parsed.active, 2);
+        assert_eq!(parsed.stages, vec![400, 800]);
+
+        // A garbage count must not read past the 5-entry table.
+        resp[10] = 0xFF;
+        assert_eq!(parse_dpi_stages(&resp).stages.len(), 5);
     }
 
     #[test]
