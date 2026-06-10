@@ -9,11 +9,9 @@ Controls the LED color of the **Razer Mouse Dock Pro** and a wirelessly connecte
 | Device | USB ID | Connection |
 |---|---|---|
 | Razer Mouse Dock Pro | `1532:00A4` | USB |
-| Razer Basilisk V3 Pro 35K | `1532:00CC` | Wired |
-| Razer Basilisk V3 Pro 35K | `1532:00CD` | Wireless dongle |
 | Razer Basilisk V3 Pro 35K | via `1532:00A4` | Wireless through dock |
 
-When the mouse is connected wirelessly through the dock, razerd sends a single command to the dock which routes it to the mouse over the RF link — no separate USB device needed.
+razerd talks exclusively to the dock: every command is sent to it, and the dock routes mouse commands over the RF link — no separate USB device needed. A mouse connected directly over USB cable (`1532:00CC`) or through the standalone dongle (`1532:00CD`) is **not** supported.
 
 ## Usage
 
