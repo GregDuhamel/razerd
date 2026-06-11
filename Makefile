@@ -20,7 +20,7 @@ uninstall:
 	@echo "✓ removed: $(BIN)"
 
 install-watch: install
-	install -Dm 0644 razerd-watch.service $(WATCH_UNIT)
+	install -Dm 0644 contrib/razerd-watch.service $(WATCH_UNIT)
 	systemctl --user daemon-reload
 	systemctl --user enable --now razerd-watch.service
 	@echo "✓ watch service enabled (re-applies color the moment the mouse wakes)"

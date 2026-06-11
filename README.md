@@ -206,6 +206,20 @@ The protocol was reverse-engineered from USB captures of Razer Synapse on Window
 
 ## Development
 
+### Source layout
+
+| File | Role |
+|---|---|
+| `src/main.rs` | Module wiring and the flag → action dispatch — nothing else |
+| `src/hid.rs` | Hidraw transport: device discovery via sysfs, feature-report ioctls, the send/poll exchange with its response-correlation check |
+| `src/protocol.rs` | The Razer report layer: 90-byte format, command constants, typed queries/writes (battery, serial, firmware, DPI, stages, profiles) |
+| `src/cli.rs` | The clap surface: flags, parsers, flag-to-action mapping |
+| `src/actions.rs` | One `run_*` function per flag: the `--watch` loop, the `--info` report, the sensitivity writes |
+| `contrib/razerd-watch.service` | systemd user unit running `razerd --watch` (installed by `make install-watch`) |
+| `contrib/razerd-battery-notify{,.service,.timer}` | Low-battery desktop notifier: shell helper + systemd timer (installed by `make install-notify`) |
+
+Unit tests live next to what they test (`mod tests` per module). One hardware-gated smoke test is excluded from CI — run it with the dock connected: `cargo test -- --ignored`.
+
 ```bash
 make build         # cargo build --release
 make install       # build + copy to ~/.local/bin/
