@@ -133,7 +133,7 @@ sudo tee /etc/udev/rules.d/99-razerd.rules << 'EOF'
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1532", ATTR{idProduct}=="00a4", GROUP="razerd", MODE="0660"
 KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00a4", GROUP="razerd", MODE="0660"
 EOF
-sudo groupadd -f razerd
+sudo groupadd -rf razerd
 sudo usermod -aG razerd $USER
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
@@ -143,6 +143,20 @@ Log out and back in, then verify:
 ```bash
 razerd --check
 ```
+
+`-r` makes `razerd` a **system group** (GID < 1000). `systemd-udevd` ≥ 258 warns at every boot that device-node ownership by a non-system group is deprecated and will stop working in a future release, so a plain user group is not an option any more.
+
+**Already installed with a user group?** If `getent group razerd` shows a GID ≥ 1000, recreate it as a system group, then **reboot**:
+
+```bash
+sudo groupdel razerd && sudo groupadd -r razerd && sudo usermod -aG razerd $USER
+```
+
+The reboot is not optional: udevd resolves `GROUP="razerd"` to a numeric GID when it loads the rules, your session and a lingering user manager (`user@<uid>.service`) keep the old GID in their supplementary groups, and `udevadm trigger` alone just re-applies the cached GID. Only a reboot brings udevd, the device nodes and `razerd-watch.service` back in agreement.
+
+Why a group rather than `TAG+="uaccess"`: the ACL granted by `uaccess` only exists while you have an active seat session, so a lingering `razerd-watch.service` started at boot would have no access to the dock until you log in.
+
+On distributions whose initramfs is built with dracut in `hostonly` mode (Fedora), the rule file is copied into the initrd verbatim, where the `razerd` group does not exist. The initrd's udevd then logs two `Failed to resolve group 'razerd', ignoring` lines very early in the boot. They are harmless — the dock is not needed before the root filesystem is mounted.
 
 ### 3. (Optional) systemd user service
 
