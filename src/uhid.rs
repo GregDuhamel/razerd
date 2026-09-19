@@ -12,11 +12,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
 const UHID_PATH: &str = "/dev/uhid";
+const POWER_SUPPLY_SYSFS_ROOT: &str = "/sys/class/power_supply";
 
 // `/dev/uhid` is the misc device (major 10) with minor 239 (`UHID_MINOR`).
 const UHID_RDEV: libc::dev_t = libc::makedev(10, 239);
@@ -144,6 +146,42 @@ const _: () = assert!(
     BATTERY_MOUSE_DESCRIPTOR.len() <= HID_MAX_DESCRIPTOR_SIZE,
     "report descriptor exceeds the uhid limit"
 );
+
+/// The battery the kernel registered for our virtual device, read back from
+/// sysfs — the very view UPower has of it.
+pub(crate) struct ExposedBattery {
+    pub(crate) path: PathBuf,
+    pub(crate) percent: Option<String>,
+    pub(crate) status: Option<String>,
+}
+
+/// Look up the power supply behind a running `--upower`, if any. For `--info`,
+/// a separate process: the bridge itself must never read these attributes —
+/// the kernel may answer a read by querying the bridge (`GET_REPORT`), which
+/// would then be waiting on itself.
+pub(crate) fn exposed_battery() -> Option<ExposedBattery> {
+    find_exposed_battery(Path::new(POWER_SUPPLY_SYSFS_ROOT))
+}
+
+fn find_exposed_battery(root: &Path) -> Option<ExposedBattery> {
+    // `hid-<uniq>-battery`, with a numeric suffix on recent kernels.
+    let prefix = format!("hid-{DEVICE_UNIQ}-battery");
+    let path = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))?
+        .path();
+    let attribute = |name: &str| {
+        std::fs::read_to_string(path.join(name))
+            .ok()
+            .map(|value| value.trim().to_owned())
+    };
+    Some(ExposedBattery {
+        percent: attribute("capacity"),
+        status: attribute("status"),
+        path,
+    })
+}
 
 /// Get a read-write handle on `/dev/uhid`.
 ///
@@ -434,6 +472,28 @@ mod tests {
         assert_eq!(ev[268..272], 0x00CCu32.to_ne_bytes());
         assert_eq!(ev[272..280], [0u8; 8]); // version, country
         assert_eq!(&ev[280..], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn exposed_battery_is_found_by_its_power_supply_name() {
+        let root = std::env::temp_dir().join(format!("razerd-test-{}", std::process::id()));
+        let ours = root.join("hid-razerd-battery-2");
+        std::fs::create_dir_all(&ours).unwrap();
+        std::fs::create_dir_all(root.join("hid-SOMEONE-ELSE-battery")).unwrap();
+        std::fs::write(ours.join("capacity"), "56\n").unwrap();
+        std::fs::write(ours.join("status"), "Discharging\n").unwrap();
+
+        let battery = find_exposed_battery(&root).expect("our power supply");
+        assert_eq!(battery.path, ours);
+        assert_eq!(battery.percent.as_deref(), Some("56"));
+        assert_eq!(battery.status.as_deref(), Some("Discharging"));
+
+        // Withdrawn (or the service is stopped): nothing of ours is left.
+        std::fs::remove_dir_all(&ours).unwrap();
+        assert!(find_exposed_battery(&root).is_none());
+        // A missing sysfs root is "not exposed" too, not an error.
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(find_exposed_battery(&root).is_none());
     }
 
     #[test]
