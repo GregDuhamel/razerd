@@ -25,7 +25,7 @@ pub(crate) struct Cli {
     battery: bool,
 
     /// Print a full device report: serial, firmware, battery, DPI, stages
-    /// lock state, onboard profile.
+    /// lock state, onboard profile, and the battery exposed by --upower.
     #[arg(long, group = "action")]
     info: bool,
 

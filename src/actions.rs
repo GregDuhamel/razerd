@@ -420,6 +420,22 @@ pub(crate) fn run_info(dock: &HidrawDevice) -> Result<()> {
         awake.then(|| query_profiles(dock).ok()).flatten(),
     );
 
+    // What a running `--upower` currently hands to the kernel, read back from
+    // sysfs — i.e. what UPower and the desktop's power applet see.
+    println!();
+    println!("UPower battery (virtual HID device, via --upower)");
+    match uhid::exposed_battery() {
+        Some(battery) => {
+            println!("  Path:     {}", battery.path.display());
+            print_field(
+                "Level",
+                battery.percent.map(|percent| format!("{percent}%")),
+            );
+            print_field("Status", battery.status);
+        }
+        None => println!("  Path:     — (not exposed: bridge not running, or mouse silent)"),
+    }
+
     Ok(())
 }
 
