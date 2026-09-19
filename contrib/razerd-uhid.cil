@@ -1,0 +1,11 @@
+; SELinux policy module for razerd-battery.service (Fedora/RHEL targeted policy).
+;
+; The unit gets its /dev/uhid descriptor from the service manager (OpenFile=),
+; which opens the node while still in systemd's own domain, init_t — and the
+; stock policy has no rule letting init_t read/write uhid_device_t. This adds
+; exactly that — the three permissions an O_RDWR open() is checked against
+; (`read write` on the inode, then `open` on the file), nothing else. It widens nothing in practice: init_t is PID 1, and handing a
+; unit an OpenFile= already requires root.
+;
+; Install: semodule -i razerd-uhid.cil      Remove: semodule -r razerd-uhid
+(allow init_t uhid_device_t (chr_file (open read write)))
