@@ -1,0 +1,3 @@
+# Product names that are not code: `doc_markdown` must not ask for backticks
+# around them (in `--help` text they would be printed literally).
+doc-valid-idents = ["UPower", ".."]

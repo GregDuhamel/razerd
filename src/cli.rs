@@ -10,6 +10,7 @@ use crate::protocol::{DPI_MAX, DPI_MIN, Rgb};
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 #[command(group = clap::ArgGroup::new("action").required(true).multiple(false))]
+#[allow(clippy::struct_excessive_bools)] // one bool per valueless flag — clap's model
 pub(crate) struct Cli {
     /// Verify the dock is detected and accessible.
     #[arg(long, group = "action")]
@@ -96,7 +97,7 @@ pub(crate) enum ColorName {
 }
 
 impl ColorName {
-    pub(crate) fn rgb(self) -> Rgb {
+    pub(crate) const fn rgb(self) -> Rgb {
         match self {
             Self::Red => Rgb::new(0xC0, 0x00, 0x00),
             Self::Green => Rgb::new(0x00, 0xC0, 0x00),
@@ -106,7 +107,7 @@ impl ColorName {
         }
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Red => "red",
             Self::Green => "green",

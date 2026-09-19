@@ -7,6 +7,8 @@ license = "MIT"
 description = "Minimal Razer RGB daemon for Linux"
 repository = "https://github.com/GregDuhamel/razerd"
 readme = "README.md"
+keywords = ["razer", "rgb", "hid", "mouse", "upower"]
+categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
 anyhow = "1"

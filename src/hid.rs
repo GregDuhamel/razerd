@@ -38,11 +38,11 @@ const STATUS_BUSY: u8 = 0x01; // accepted, still working (RF round-trip pending)
 const STATUS_OK: u8 = 0x02; // completed, payload valid
 
 // Linux hidraw ioctl numbers: _IOC(_IOC_WRITE|_IOC_READ, 'H', {0x06,0x07}, len)
-fn hidioc_set_feature(len: usize) -> u64 {
+const fn hidioc_set_feature(len: usize) -> u64 {
     (3u64 << 30) | ((b'H' as u64) << 8) | 0x06 | ((len as u64) << 16)
 }
 
-fn hidioc_get_feature(len: usize) -> u64 {
+const fn hidioc_get_feature(len: usize) -> u64 {
     (3u64 << 30) | ((b'H' as u64) << 8) | 0x07 | ((len as u64) << 16)
 }
 
@@ -65,7 +65,7 @@ impl HidrawDevice {
         Ok(Self { file, path })
     }
 
-    /// Send a 90-byte HID feature report (SET_REPORT with type=feature, id=0).
+    /// Send a 90-byte HID feature report (`SET_REPORT` with type=feature, id=0).
     ///
     /// The hidraw ioctl buffer is `[report_id, ...90 bytes...]`; the kernel
     /// strips the report id and issues the USB control transfer.
@@ -92,7 +92,7 @@ impl HidrawDevice {
         Ok(())
     }
 
-    /// Read the current 90-byte feature report (GET_REPORT with type=feature).
+    /// Read the current 90-byte feature report (`GET_REPORT` with type=feature).
     fn get_feature(&self) -> Result<[u8; REPORT_LEN]> {
         let mut buf = [0u8; REPORT_LEN + 1];
 
@@ -203,7 +203,7 @@ impl HidrawDevice {
 
             match classify_response_status(response[0]) {
                 ResponseStatus::Ready => return Ok(response),
-                ResponseStatus::Pending if Instant::now() < deadline => continue,
+                ResponseStatus::Pending if Instant::now() < deadline => {} // keep polling
                 ResponseStatus::Pending => {
                     bail!("device did not answer within {RESPONSE_TIMEOUT:?}")
                 }
@@ -236,7 +236,7 @@ enum ResponseStatus {
     Failed(u8),
 }
 
-fn classify_response_status(status: u8) -> ResponseStatus {
+const fn classify_response_status(status: u8) -> ResponseStatus {
     match status {
         STATUS_OK => ResponseStatus::Ready,
         STATUS_NEW | STATUS_BUSY => ResponseStatus::Pending,
@@ -253,7 +253,7 @@ fn find_hidraw(vendor_id: u16, product_id: u16, interface: u8) -> Result<PathBuf
         .with_context(|| format!("cannot read {HID_SYSFS_ROOT}"))?
         .collect::<std::io::Result<_>>()
         .with_context(|| format!("cannot enumerate {HID_SYSFS_ROOT}"))?;
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in entries {
         let uevent_path = entry.path().join("device/uevent");
@@ -270,10 +270,7 @@ fn find_hidraw(vendor_id: u16, product_id: u16, interface: u8) -> Result<PathBuf
     }
 
     bail!(
-        "no hidraw for {:04x}:{:04x} interface {} — device not connected?",
-        vendor_id,
-        product_id,
-        interface
+        "no hidraw for {vendor_id:04x}:{product_id:04x} interface {interface} — device not connected?"
     )
 }
 

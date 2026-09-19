@@ -83,6 +83,7 @@ const START_SETTLE_DELAY: Duration = Duration::from_millis(250);
 const CHARGE_FLIP_REPUSH_DELAY: Duration = Duration::from_secs(31);
 
 // The errno carried by the GET/SET_REPORT replies we do not serve.
+#[allow(clippy::cast_possible_truncation)] // EIO is 5; `TryFrom` is not const
 const EIO: u16 = libc::EIO as u16;
 
 /// Report descriptor: one Mouse application collection holding
@@ -354,14 +355,21 @@ fn create2_event(name: &str, phys: &str, uniq: &str, descriptor: &[u8]) -> Vec<u
     copy_c_string(&mut ev[CREATE2_NAME], name);
     copy_c_string(&mut ev[CREATE2_PHYS], phys);
     copy_c_string(&mut ev[CREATE2_UNIQ], uniq);
-    ev[CREATE2_RD_SIZE..CREATE2_RD_SIZE + 2]
-        .copy_from_slice(&(descriptor.len() as u16).to_ne_bytes());
+    ev[CREATE2_RD_SIZE..CREATE2_RD_SIZE + 2].copy_from_slice(&len_u16(descriptor).to_ne_bytes());
     ev[CREATE2_BUS..CREATE2_BUS + 2].copy_from_slice(&BUS_VIRTUAL.to_ne_bytes());
     ev[CREATE2_VENDOR..CREATE2_VENDOR + 4].copy_from_slice(&RAZER_VENDOR_ID.to_ne_bytes());
     ev[CREATE2_PRODUCT..CREATE2_PRODUCT + 4]
         .copy_from_slice(&BASILISK_V3_PRO_35K_PRODUCT_ID.to_ne_bytes());
     ev[CREATE2_RD_DATA..].copy_from_slice(descriptor);
     ev
+}
+
+/// A payload length as uhid's u16 size field. Everything sent here is a few
+/// bytes, or the descriptor whose size is checked at compile time — a payload
+/// that does not fit is a bug, and silently truncating its size would corrupt
+/// the event.
+fn len_u16(payload: &[u8]) -> u16 {
+    u16::try_from(payload.len()).expect("uhid payloads are at most 4 KiB")
 }
 
 /// Copy `s` into a fixed-size, NUL-terminated C string field, truncating on a
@@ -378,7 +386,7 @@ fn copy_c_string(field: &mut [u8], s: &str) {
 fn input2_event(report: &[u8]) -> Vec<u8> {
     let mut ev = Vec::with_capacity(EV_PAYLOAD + 2 + report.len());
     ev.extend_from_slice(&UHID_INPUT2.to_ne_bytes());
-    ev.extend_from_slice(&(report.len() as u16).to_ne_bytes());
+    ev.extend_from_slice(&len_u16(report).to_ne_bytes());
     ev.extend_from_slice(report);
     ev
 }
@@ -386,15 +394,12 @@ fn input2_event(report: &[u8]) -> Vec<u8> {
 /// `struct uhid_get_report_reply_req`: `[u32 id, u16 err, u16 size, data...]`.
 /// `None` rejects the request with EIO.
 fn get_report_reply(id: [u8; 4], report: Option<&[u8]>) -> Vec<u8> {
-    let (err, data) = match report {
-        Some(data) => (0, data),
-        None => (EIO, &[][..]),
-    };
+    let (err, data) = report.map_or((EIO, &[][..]), |data| (0, data));
     let mut ev = Vec::with_capacity(EV_PAYLOAD + 8 + data.len());
     ev.extend_from_slice(&UHID_GET_REPORT_REPLY.to_ne_bytes());
     ev.extend_from_slice(&id);
     ev.extend_from_slice(&err.to_ne_bytes());
-    ev.extend_from_slice(&(data.len() as u16).to_ne_bytes());
+    ev.extend_from_slice(&len_u16(data).to_ne_bytes());
     ev.extend_from_slice(data);
     ev
 }
@@ -413,8 +418,8 @@ mod tests {
     use super::*;
 
     /// Offsets must match the packed `struct uhid_create2_req`: name[128],
-    /// phys[64], uniq[64], u16 rd_size, u16 bus, u32 vendor/product/version/
-    /// country, then rd_data — all behind the u32 event type.
+    /// phys[64], uniq[64], u16 `rd_size`, u16 bus, u32 vendor/product/version/
+    /// country, then `rd_data` — all behind the u32 event type.
     #[test]
     fn create2_event_matches_the_kernel_layout() {
         let ev = create2_event("name", "phys", "SERIAL", &[0xAA, 0xBB, 0xCC]);
@@ -487,7 +492,7 @@ mod tests {
 
     /// Walk the descriptor's short items: collections must balance, and the
     /// battery report must be `[id, strength, charging]` with the strength
-    /// directly after the id — the kernel's GET_REPORT path reads `buf[1]`.
+    /// directly after the id — the kernel's `GET_REPORT` path reads `buf[1]`.
     #[test]
     fn descriptor_is_well_formed_and_strength_comes_first() {
         let d = BATTERY_MOUSE_DESCRIPTOR;
@@ -499,13 +504,13 @@ mod tests {
             let data = d[i + 1..i + 1 + size]
                 .iter()
                 .rev()
-                .fold(0u32, |acc, b| (acc << 8) | *b as u32);
+                .fold(0u32, |acc, b| (acc << 8) | u32::from(*b));
             match prefix & 0xFC {
                 0xA0 => depth += 1,       // Collection
                 0xC0 => depth -= 1,       // End Collection
                 0x04 => page = data,      // Usage Page
                 0x84 => report_id = data, // Report ID
-                0x08 if report_id == REPORT_ID_BATTERY as u32 => {
+                0x08 if report_id == u32::from(REPORT_ID_BATTERY) => {
                     battery_usages.push((page, data)); // Usage
                 }
                 _ => {}
