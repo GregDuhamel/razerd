@@ -152,13 +152,13 @@ make build
 sudo make install
 ```
 
-Installs `razerd` (and the `razerd-battery-notify` helper) to `/usr/local/bin`, root-owned. `make install` never invokes cargo, so nothing is compiled as root. Override the location with `PREFIX=...`; the systemd units follow it.
+Installs `razerd` to `/usr/local/bin`, root-owned. `make install` never invokes cargo, so nothing is compiled as root. Override the location with `PREFIX=...`; the systemd units follow it.
 
 Remove with `sudo make uninstall`.
 
 Why system-wide: `razerd-battery.service` is a system service holding a `/dev/uhid` descriptor. If it ran a binary from your home directory, any process of yours could replace that binary and inherit the descriptor.
 
-**Upgrading from a `~/.local` install (≤ 0.9.3):** the user units used to point at `~/.local/bin`. After `sudo make install`, re-run `make install-watch` (and `make install-notify` if you use it) to refresh them, then drop the old copy: `rm ~/.local/bin/razerd ~/.local/bin/razerd-battery-notify`.
+**Upgrading from a `~/.local` install (≤ 0.9.3):** the user units used to point at `~/.local/bin`. After `sudo make install`, re-run `make install-watch` to refresh it, then drop the old copy: `rm ~/.local/bin/razerd`.
 
 ### 2. udev rules (grant non-root access to the dock)
 
@@ -232,27 +232,6 @@ Installs and enables `razerd-battery.service`, a **system** service running `raz
 - System calls are an allow-list (`@default @basic-io @io-event @file-system @signal` + `ioctl`) rather than the usual broad `@system-service`.
 - In the code, the report descriptor and the device identity are compile-time constants, and the only values ever written to the virtual device are a percentage and a charging bit — no string from the dock, and no code path that emits a key, a button or motion. Its only inputs are fixed-size replies from the dock and fixed-size events from the kernel.
 
-### 5. (Optional) Low-battery desktop notifications
-
-With the battery bridge above, KDE and GNOME already warn about a low peripheral battery by themselves — this notifier is for setups without it.
-
-```bash
-make install-notify
-```
-
-Installs a shell helper (`razerd-battery-notify`) together with a systemd user timer that polls `razerd --battery` every 5 minutes and fires a `notify-send` notification when the level drops below 20% and the mouse is not charging.
-
-Tune the threshold with a drop-in:
-
-```bash
-systemctl --user edit razerd-battery-notify.service
-# then add:
-#   [Service]
-#   Environment=RAZERD_LOW_BATTERY=15
-```
-
-Remove with `make uninstall-notify`.
-
 ## How it works
 
 razerd communicates with the dock via the Linux `hidraw` interface using `HIDIOCSFEATURE` ioctls — no kernel driver detachment, no libusb.
@@ -287,7 +266,6 @@ The protocol was reverse-engineered from USB captures of Razer Synapse on Window
 | `contrib/razerd-watch.service` | systemd user unit running `razerd --watch` (installed by `make install-watch`) |
 | `contrib/razerd-battery.service` | Hardened systemd **system** unit running `razerd --upower` (installed by `sudo make install-battery`) |
 | `contrib/razerd-uhid.cil` | One-rule SELinux module letting systemd open `/dev/uhid` for that unit (loaded by `install-battery` when SELinux is enabled) |
-| `contrib/razerd-battery-notify{,.service,.timer}` | Low-battery desktop notifier: shell helper + systemd timer (installed by `make install-notify`) |
 
 Unit tests live next to what they test (`mod tests` per module). One hardware-gated smoke test is excluded from CI — run it with the dock connected: `cargo test -- --ignored`.
 
