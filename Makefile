@@ -1,4 +1,4 @@
-.PHONY: build install uninstall install-watch uninstall-watch install-notify uninstall-notify install-battery uninstall-battery clean
+.PHONY: build install uninstall install-watch uninstall-watch install-battery uninstall-battery clean
 
 # System-wide by default: the binary must be root-owned, because
 # razerd-battery.service (a system unit holding a /dev/uhid descriptor) runs
@@ -8,11 +8,8 @@
 PREFIX          ?= /usr/local
 BINDIR          := $(PREFIX)/bin
 BIN             := $(BINDIR)/razerd
-NOTIFY_BIN      := $(BINDIR)/razerd-battery-notify
 UNIT_DIR        := $(HOME)/.config/systemd/user
 WATCH_UNIT      := $(UNIT_DIR)/razerd-watch.service
-NOTIFY_UNIT     := $(UNIT_DIR)/razerd-battery-notify.service
-NOTIFY_TIMER    := $(UNIT_DIR)/razerd-battery-notify.timer
 SYSTEM_UNIT_DIR := /etc/systemd/system
 BATTERY_UNIT    := $(SYSTEM_UNIT_DIR)/razerd-battery.service
 
@@ -29,12 +26,11 @@ build:
 install:
 	@if [ ! -f target/release/razerd ]; then echo "✗ target/release/razerd not found — run 'make build' first (without sudo)"; exit 1; fi
 	install -Dm 0755 target/release/razerd $(BIN)
-	install -Dm 0755 contrib/razerd-battery-notify $(NOTIFY_BIN)
-	@echo "✓ installed: $(BIN), $(NOTIFY_BIN)"
+	@echo "✓ installed: $(BIN)"
 
 uninstall:
-	rm -f $(BIN) $(NOTIFY_BIN)
-	@echo "✓ removed: $(BIN), $(NOTIFY_BIN)"
+	rm -f $(BIN)
+	@echo "✓ removed: $(BIN)"
 
 install-watch:
 	$(require_user)
@@ -53,24 +49,6 @@ uninstall-watch:
 	rm -f $(WATCH_UNIT)
 	systemctl --user daemon-reload
 	@echo "✓ watch service removed"
-
-install-notify:
-	$(require_user)
-	$(require_bin)
-	$(call install_unit,contrib/razerd-battery-notify.service,$(NOTIFY_UNIT))
-	install -Dm 0644 contrib/razerd-battery-notify.timer $(NOTIFY_TIMER)
-	systemctl --user daemon-reload
-	systemctl --user enable --now razerd-battery-notify.timer
-	@echo "✓ low-battery notifier enabled (checks every 5 min, threshold 20%)"
-	@echo "  Override threshold: systemctl --user edit razerd-battery-notify.service"
-	@echo "  and add [Service] Environment=RAZERD_LOW_BATTERY=15"
-
-uninstall-notify:
-	$(require_user)
-	-systemctl --user disable --now razerd-battery-notify.timer razerd-battery-notify.service
-	rm -f $(NOTIFY_UNIT) $(NOTIFY_TIMER)
-	systemctl --user daemon-reload
-	@echo "✓ low-battery notifier removed"
 
 # System unit: run with sudo.
 install-battery:

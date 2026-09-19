@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(parse_battery_percent(127), 49); // integer truncation
     }
 
-    /// `razerd-battery-notify` parses this text out of `--battery`.
+    /// Scripts parse this text out of `--battery`: keep it stable.
     #[test]
     fn battery_status_formats_with_charging_suffix() {
         let discharging = BatteryStatus {
