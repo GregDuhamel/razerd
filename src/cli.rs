@@ -36,6 +36,11 @@ pub(crate) struct Cli {
     #[arg(long, value_enum, value_name = "COLOR", group = "action")]
     watch: Option<ColorName>,
 
+    /// Expose the mouse battery to UPower (KDE/GNOME power applets) through a
+    /// virtual HID device (runs until stopped; see razerd-battery.service).
+    #[arg(long, group = "action")]
+    upower: bool,
+
     /// Set the sensitivity to one fixed DPI value (the free slider): collapses
     /// the onboard stage table to it, so the Cycle Up Sensitivity Stages
     /// button can't change it.
@@ -56,6 +61,7 @@ pub(crate) enum Action {
     Info,
     Sniff,
     Watch(ColorName),
+    Upower,
     Sensitivity(u16),
     SensitivityStages(bool),
 }
@@ -69,6 +75,7 @@ impl Cli {
             self.info.then_some(Action::Info),
             self.sniff.then_some(Action::Sniff),
             self.watch.map(Action::Watch),
+            self.upower.then_some(Action::Upower),
             self.sensitivity.map(Action::Sensitivity),
             self.sensitivity_stages.map(Action::SensitivityStages),
         ]
@@ -173,6 +180,7 @@ mod tests {
             action(&["razerd", "--color", "blue"]),
             Action::Color(ColorName::Blue)
         ));
+        assert!(matches!(action(&["razerd", "--upower"]), Action::Upower));
         assert!(matches!(
             action(&["razerd", "--sensitivity", "1800"]),
             Action::Sensitivity(1800)

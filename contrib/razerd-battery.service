@@ -1,0 +1,58 @@
+[Unit]
+Description=Razer mouse battery bridge to UPower (virtual HID battery)
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/razerd --upower
+# Exits when the dock is unplugged; come back once it is plugged in again.
+Restart=on-failure
+RestartSec=30
+
+# /dev/uhid lets its holder create arbitrary input devices, so nobody is
+# granted access to it: the node stays root:root 0600, the service manager
+# opens it and passes the descriptor, and the process runs as a throwaway
+# unprivileged user whose only other device is the dock's hidraw (via the
+# razerd group from the udev rule).
+OpenFile=/dev/uhid:uhid
+DynamicUser=yes
+SupplementaryGroups=razerd
+DevicePolicy=closed
+DeviceAllow=char-hidraw rw
+# Needed for OpenFile= itself: systemd opens the node from inside this unit's
+# device cgroup. It does not let the process open it — root:root 0600 still
+# applies, and the process is neither root nor holds any capability.
+DeviceAllow=/dev/uhid rw
+
+# It talks to two character devices and nothing else: no capabilities, no
+# network, no sockets (not even D-Bus), a read-only view of the system.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=none
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+UMask=0077
+SystemCallArchitectures=native
+# Allow-list, not the usual @system-service: everything the process does is
+# read/write/poll/ioctl on two descriptors plus sysfs discovery of the dock.
+SystemCallFilter=@default @basic-io @io-event @file-system @signal ioctl
+
+[Install]
+WantedBy=multi-user.target

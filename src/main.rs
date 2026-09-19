@@ -8,11 +8,14 @@
 //! Layout: [`hid`] is the hidraw transport (discovery, ioctls, send/poll
 //! exchange), [`protocol`] the Razer report format and typed queries,
 //! [`cli`] the flag surface, and [`actions`] the verb behind each flag.
+//! [`uhid`] is the one piece that does not talk to the dock: the virtual HID
+//! device `--upower` uses to hand the mouse battery to the kernel.
 
 mod actions;
 mod cli;
 mod hid;
 mod protocol;
+mod uhid;
 
 use anyhow::Result;
 use clap::Parser;
@@ -32,6 +35,7 @@ fn main() -> Result<()> {
         Action::Info => actions::run_info(&dock),
         Action::Sniff => actions::run_sniff(&dock),
         Action::Watch(c) => actions::run_watch(&dock, c),
+        Action::Upower => actions::run_upower(&dock),
         Action::Sensitivity(d) => actions::run_sensitivity(&dock, d),
         Action::SensitivityStages(on) => actions::run_sensitivity_stages(&dock, on),
     }

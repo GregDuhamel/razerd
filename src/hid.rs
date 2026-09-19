@@ -28,6 +28,10 @@ const HID_ID_USB_PREFIX: &str = "0003";
 pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
 const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
+// The hidraw driver queues at most this many input reports per open handle
+// (HIDRAW_BUFFER_SIZE), dropping the oldest beyond that.
+const HIDRAW_BUFFER_REPORTS: usize = 64;
+
 // Response status byte (`response[0]`) values used by the Razer firmware.
 const STATUS_NEW: u8 = 0x00; // not processed yet
 const STATUS_BUSY: u8 = 0x01; // accepted, still working (RF round-trip pending)
@@ -81,7 +85,9 @@ impl HidrawDevice {
             )
         };
         if ret < 0 {
-            bail!("HIDIOCSFEATURE failed: {}", std::io::Error::last_os_error());
+            // Keep the io::Error in the chain: callers tell a vanished dock
+            // (ENODEV) from a mouse that merely does not answer.
+            return Err(std::io::Error::last_os_error()).context("HIDIOCSFEATURE failed");
         }
         Ok(())
     }
@@ -100,7 +106,7 @@ impl HidrawDevice {
             )
         };
         if ret < 0 {
-            bail!("HIDIOCGFEATURE failed: {}", std::io::Error::last_os_error());
+            return Err(std::io::Error::last_os_error()).context("HIDIOCGFEATURE failed");
         }
 
         let mut response = [0u8; REPORT_LEN];
@@ -120,6 +126,58 @@ impl HidrawDevice {
         (&self.file)
             .read(buf)
             .context("reading hidraw input report")
+    }
+
+    /// Wait until an input report is queued or `deadline` passes; `true` means
+    /// input is pending. Long-running actions use it as a "the mouse is being
+    /// moved" signal without consuming the stream report by report.
+    pub(crate) fn wait_for_input(&self, deadline: Instant) -> Result<bool> {
+        loop {
+            // Recomputed each turn: a signal cuts a poll short.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if self.poll_input(remaining)? {
+                return Ok(true);
+            }
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Discard every queued input report without blocking. The kernel keeps at
+    /// most 64 per open handle, so this is bounded even while the mouse moves.
+    pub(crate) fn drain_input_reports(&self) -> Result<()> {
+        let mut buf = [0u8; 64];
+        for _ in 0..HIDRAW_BUFFER_REPORTS {
+            if !self.poll_input(Duration::ZERO)? {
+                break;
+            }
+            self.read_input_report(&mut buf)?;
+        }
+        Ok(())
+    }
+
+    /// One `poll(POLLIN)` on the handle; `false` on timeout or a benign signal.
+    fn poll_input(&self, timeout: Duration) -> Result<bool> {
+        let mut pfd = libc::pollfd {
+            fd: self.file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Rounded up: a sub-millisecond remainder must sleep, not spin.
+        let timeout_ms =
+            timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: one valid pollfd over an owned fd; the kernel only writes
+        // `revents`. A negative return means error, with errno set.
+        let ret = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err).with_context(|| format!("poll on {} failed", self.path.display()));
+        }
+        Ok(ret > 0)
     }
 
     /// Send a request and poll for the matching 90-byte response, returning it
@@ -155,6 +213,16 @@ impl HidrawDevice {
             }
         }
     }
+}
+
+/// Did this exchange fail because the hidraw node itself is gone (dock
+/// unplugged)? Long-running actions must exit on that — the handle will never
+/// work again — whereas a timeout or a firmware error status only means the
+/// mouse is asleep or out of range.
+pub(crate) fn is_device_gone(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.raw_os_error() == Some(libc::ENODEV))
 }
 
 /// Outcome of inspecting a response's status byte (`response[0]`).
@@ -244,6 +312,22 @@ mod tests {
         // 0x03 failure, 0x04 no-response, 0x05 unsupported — all terminal.
         assert_eq!(classify_response_status(0x03), ResponseStatus::Failed(0x03));
         assert_eq!(classify_response_status(0x05), ResponseStatus::Failed(0x05));
+    }
+
+    #[test]
+    fn device_gone_is_enodev_anywhere_in_the_chain() {
+        let gone = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENODEV))
+            .context("HIDIOCSFEATURE failed")
+            .context("battery level query failed");
+        assert!(is_device_gone(&gone));
+
+        // A stalled control transfer is transient, not a missing device.
+        let stalled = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EPIPE))
+            .context("HIDIOCSFEATURE failed");
+        assert!(!is_device_gone(&stalled));
+
+        // Timeouts and firmware error statuses carry no io::Error at all.
+        assert!(!is_device_gone(&anyhow::anyhow!("device did not answer")));
     }
 
     /// Regression test: HIDIOCSFEATURE for a 91-byte buffer must match what
