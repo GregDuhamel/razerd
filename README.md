@@ -2,7 +2,7 @@
 
 Minimal RGB daemon for Razer peripherals on Linux.
 
-Controls the LED color of the **Razer Mouse Dock Pro** and a wirelessly connected **Razer Basilisk V3 Pro 35K** simultaneously, without requiring OpenRazer or any Razer software.
+Controls the LED color of the **Razer Mouse Dock Pro** and a wirelessly connected **Razer Basilisk V3 Pro 35K** simultaneously, without requiring OpenRazer or any Razer software. It also sets the mouse sensitivity and publishes the mouse battery to UPower, so it shows up in the KDE / GNOME power applet like any other wireless peripheral.
 
 ## Supported devices
 
@@ -18,6 +18,7 @@ razerd talks exclusively to the dock: every command is sent to it, and the dock 
 ```
 razerd --color <COLOR>
 razerd --watch <COLOR>
+razerd --upower
 razerd --sensitivity <DPI>
 razerd --sensitivity-stages <on|off>
 razerd --check
@@ -32,6 +33,7 @@ razerd --sniff
 |---|---|
 | `--color red\|green\|blue\|white\|off` | Apply color to dock and mouse once |
 | `--watch red\|green\|blue\|white\|off` | Hold a color, re-applying it whenever the mouse wakes (runs until stopped) |
+| `--upower` | Expose the mouse battery to UPower (KDE / GNOME power applets) through a virtual HID device (runs until stopped — meant for `razerd-battery.service`) |
 | `--sensitivity <value>` (alias `--dpi`) | Set the sensitivity to one fixed DPI value (100–35000), disabling the Cycle Up Sensitivity Stages button |
 | `--sensitivity-stages on\|off` | `on`: install the 5-stage table (400/800/1600/3200/6400) and enable the Cycle Up Sensitivity Stages button; `off`: freeze the current DPI and disable it |
 | `--check` | Verify devices are detected and accessible |
@@ -97,6 +99,26 @@ How it works: the dock emits no dedicated wake event, but it resumes forwarding 
 
 Run it as a background service to keep your color persistent — see [Installation](#3-optional-systemd-user-service).
 
+### Battery in the desktop's power applet: `--upower`
+
+Desktop power applets (KDE's *Power and Battery*, GNOME's power panel) list the peripherals **UPower** knows about, and UPower only knows what the kernel registers under `/sys/class/power_supply`. The dock reports the mouse battery over Razer's vendor protocol, which the kernel does not speak — so the mouse is missing there.
+
+`--upower` bridges the gap: it creates a virtual HID device named *Razer Basilisk V3 Pro 35K* through `/dev/uhid` whose report descriptor declares a standard *Battery Strength* field and a *Charging* bit, and mirrors the real readings into it. The kernel's generic HID battery support turns that into a `/sys/class/power_supply/hid-razerd-battery*` entry; UPower and the applet pick it up from there, with the desktop's own low-battery warning for peripherals on top.
+
+```bash
+upower -d | grep -A12 Basilisk    # once the service runs
+```
+
+Behavior:
+
+- The **level** is refreshed once a minute. **Charging flips** are caught much faster, without polling fast all day: the charging state only changes when the mouse is put on or lifted off the dock, and either one moves it — so `--upower` watches the dock's input stream (sampling it twice a second, never following it report by report) and queries the battery 1 s after the mouse starts moving, then 2 s and 8 s after it comes to rest. Docking or lifting shows up within a few seconds.
+- The battery only exists while the mouse answers. It appears with a **first real reading** — never a made-up level.
+- A mouse that stops answering is asleep, switched off, out of range or unpaired; the dock reports the same "no RF reply" for all of them. After an unanswered poll `--upower` retries every 3 s, and once the silence has held for **10 seconds** the battery is **withdrawn** rather than left showing a stale level — the way a Bluetooth peripheral's battery vanishes on disconnect. One lost poll never makes it flicker. Switching the mouse off moves it, which triggers a poll: the entry is gone ~10 s later. A mouse that falls asleep is noticed by the next minute refresh. The battery comes back about a second after the mouse is moved again (or within ~10 s if it becomes reachable without moving); a silent mouse costs one ~10 ms query every 10 s.
+- When the **dock** is unplugged the process exits and the battery disappears at once; the service brings it back within ~30 s of the dock returning (plus the first reading).
+- The virtual device carries an inert pointer collection (no event is ever emitted on it): the kernel drops HID devices without any input capability, and UPower labels a HID battery after its sibling input device — this is what makes it a "mouse". The side effect is a second, silent *Razer Basilisk V3 Pro 35K* entry in the desktop's list of pointing devices.
+
+`--upower` needs a handle on `/dev/uhid`, which is root-only — and should stay so. Run it through the hardened system service rather than by hand: see [Battery bridge](#4-optional-battery-in-the-desktops-power-applet).
+
 ### Diagnostics: `--sniff`
 
 `--sniff` opens the dock's hidraw interface and prints every HID **input** report it emits, with a timestamp relative to start. It is a read-only diagnostic — it sends nothing — used to observe how the dock behaves over time (e.g. what it reports when the wireless mouse sleeps and wakes).
@@ -119,12 +141,17 @@ The reports are standard 8-byte mouse-motion packets — bytes 4–5 are the sig
 ### 1. Build and install the binary
 
 ```bash
-make install
+make build
+sudo make install
 ```
 
-Installs to `~/.local/bin/razerd`. Override with `PREFIX=/usr/local sudo -E make install` for a system-wide install. Make sure `~/.local/bin` is in your `PATH`.
+Installs `razerd` (and the `razerd-battery-notify` helper) to `/usr/local/bin`, root-owned. `make install` never invokes cargo, so nothing is compiled as root. Override the location with `PREFIX=...`; the systemd units follow it.
 
-Remove with `make uninstall`.
+Remove with `sudo make uninstall`.
+
+Why system-wide: `razerd-battery.service` is a system service holding a `/dev/uhid` descriptor. If it ran a binary from your home directory, any process of yours could replace that binary and inherit the descriptor.
+
+**Upgrading from a `~/.local` install (≤ 0.9.3):** the user units used to point at `~/.local/bin`. After `sudo make install`, re-run `make install-watch` (and `make install-notify` if you use it) to refresh them, then drop the old copy: `rm ~/.local/bin/razerd ~/.local/bin/razerd-battery-notify`.
 
 ### 2. udev rules (grant non-root access to the dock)
 
@@ -182,7 +209,25 @@ To also run at **boot** before you log in:
 sudo loginctl enable-linger $USER
 ```
 
-### 4. (Optional) Low-battery desktop notifications
+### 4. (Optional) Battery in the desktop's power applet
+
+```bash
+sudo make install-battery
+```
+
+Installs and enables `razerd-battery.service`, a **system** service running `razerd --upower` — see [Battery in the desktop's power applet](#battery-in-the-desktops-power-applet---upower). It starts at boot, no lingering needed. Logs: `journalctl -u razerd-battery.service`. Remove with `sudo make uninstall-battery`.
+
+**Permissions — what this does and does not grant.** Whoever can open `/dev/uhid` can create arbitrary input devices: inject keystrokes, or feed crafted descriptors to the kernel's HID parsers. So razerd grants that to nobody:
+
+- `/dev/uhid` stays `root:root 0600`. No udev rule, no group — your account and the `razerd` group gain nothing.
+- The service manager opens the node itself and passes the descriptor to the service (`OpenFile=/dev/uhid`). On SELinux systems (Fedora) the stock policy does not let systemd do that, so `make install-battery` also loads a one-rule policy module, `contrib/razerd-uhid.cil`: `init_t` — PID 1's own domain, nothing else — may `open read write` `uhid_device_t` (what one `O_RDWR` open is checked against). It is not what keeps your account out of uhid (that is the node's `0600`, untouched), and a root process in `init_t` could already reach uhid by exec'ing into an unconfined domain — so the rule removes no effective barrier. Closing it — the process exiting for any reason — makes the kernel remove the virtual device.
+- The process runs as a throwaway unprivileged user (`DynamicUser=yes`) with no capabilities, no network, no sockets (not even D-Bus), a read-only filesystem, and a closed device allow-list: the dock's hidraw (through the `razerd` group of step 2), plus `/dev/uhid` itself — required for systemd to open it on the service's behalf, and useless to the process, which has neither the ownership nor a capability to get past `0600`. Check the result with `systemd-analyze security razerd-battery.service`.
+- System calls are an allow-list (`@default @basic-io @io-event @file-system @signal` + `ioctl`) rather than the usual broad `@system-service`.
+- In the code, the report descriptor and the device identity are compile-time constants, and the only values ever written to the virtual device are a percentage and a charging bit — no string from the dock, and no code path that emits a key, a button or motion. Its only inputs are fixed-size replies from the dock and fixed-size events from the kernel.
+
+### 5. (Optional) Low-battery desktop notifications
+
+With the battery bridge above, KDE and GNOME already warn about a low peripheral battery by themselves — this notifier is for setups without it.
 
 ```bash
 make install-notify
@@ -214,6 +259,8 @@ The Razer Mouse Dock Pro (`1532:00A4`) exposes three HID interfaces on USB. All 
 
 Battery queries use command class `0x07` (power): `cmd=0x80` for level, `cmd=0x84` for charging status. Onboard profile queries use class `0x05`: `cmd=0x80` for the slot count, `cmd=0x84` for the active slot. DPI uses class `0x04`: `cmd=0x85` reads and `cmd=0x05` writes X/Y as big-endian u16 pairs behind a storage-slot byte (`0x00` = live/RAM — what the sensor runs at and what the Cycle Up Sensitivity Stages button updates; `0x01` = persistent). The Cycle Up Sensitivity Stages button's stage table is `cmd=0x86`/`0x06`: active stage, stage count, then up to 5 × (index, X, Y, 2 reserved); `--sensitivity` writes it with a single stage. The dock forwards the request over RF and the mouse's reply is read back with `HIDIOCGFEATURE`.
 
+`--upower` is the one feature that does not talk to the dock alone: it writes `uhid` events (`UHID_CREATE2`, then one `UHID_INPUT2` per reading: `[report id, strength 0–100, charging bit]`) to a `/dev/uhid` descriptor inherited from systemd, and answers the kernel's `UHID_GET_REPORT` when the level is read before a report landed. The device sits on `BUS_VIRTUAL`, so only `hid-generic` binds to it — never a Razer-specific driver or userspace matcher keyed on `usb:1532:*`.
+
 The protocol was reverse-engineered from USB captures of Razer Synapse on Windows using Wireshark.
 
 > **Note:** Do not send HID feature reports to interface 2 (`/dev/hidraw2`) — it causes the dock firmware to reboot.
@@ -227,20 +274,25 @@ The protocol was reverse-engineered from USB captures of Razer Synapse on Window
 | `src/main.rs` | Module wiring and the flag → action dispatch — nothing else |
 | `src/hid.rs` | Hidraw transport: device discovery via sysfs, feature-report ioctls, the send/poll exchange with its response-correlation check |
 | `src/protocol.rs` | The Razer report layer: 90-byte format, command constants, typed queries/writes (battery, serial, firmware, DPI, stages, profiles) |
+| `src/uhid.rs` | The virtual HID battery behind `--upower`: report descriptor, hand-serialized `uhid` events, systemd fd inheritance |
 | `src/cli.rs` | The clap surface: flags, parsers, flag-to-action mapping |
-| `src/actions.rs` | One `run_*` function per flag: the `--watch` loop, the `--info` report, the sensitivity writes |
+| `src/actions.rs` | One `run_*` function per flag: the `--watch` loop, the `--upower` loop, the `--info` report, the sensitivity writes |
 | `contrib/razerd-watch.service` | systemd user unit running `razerd --watch` (installed by `make install-watch`) |
+| `contrib/razerd-battery.service` | Hardened systemd **system** unit running `razerd --upower` (installed by `sudo make install-battery`) |
+| `contrib/razerd-uhid.cil` | One-rule SELinux module letting systemd open `/dev/uhid` for that unit (loaded by `install-battery` when SELinux is enabled) |
 | `contrib/razerd-battery-notify{,.service,.timer}` | Low-battery desktop notifier: shell helper + systemd timer (installed by `make install-notify`) |
 
 Unit tests live next to what they test (`mod tests` per module). One hardware-gated smoke test is excluded from CI — run it with the dock connected: `cargo test -- --ignored`.
 
 ```bash
-make build         # cargo build --release
-make install       # build + copy to ~/.local/bin/
-make install-watch # install + enable the --watch systemd service
-make uninstall
+make build                # cargo build --release
+sudo make install         # copy to /usr/local/bin (never builds)
+make install-watch        # enable the --watch systemd user service
+sudo make install-battery # enable the --upower systemd system service
+sudo make uninstall
 make uninstall-watch
-make clean         # cargo clean
+sudo make uninstall-battery
+make clean                # cargo clean
 ```
 
 CI runs `cargo fmt --check`, `cargo check`, `cargo clippy -D warnings`, `cargo doc -D warnings`, and a release build on every push and PR.
@@ -251,7 +303,7 @@ Releases are cut via the **Release** GitHub Action (`workflow_dispatch`) — pic
 
 - [`clap`](https://github.com/clap-rs/clap) — CLI argument parsing
 - [`anyhow`](https://github.com/dtolnay/anyhow) — error handling
-- [`libc`](https://github.com/rust-lang/libc) — `ioctl` for `HIDIOCSFEATURE`
+- [`libc`](https://github.com/rust-lang/libc) — `ioctl` for `HIDIOCSFEATURE`, `poll`
 
 ## License
 
