@@ -65,13 +65,13 @@ pub(crate) const CMD_SET_MATRIX_EFFECT: u8 = 0x03;
 
 // Dock LED ring layout.
 pub(crate) const DOCK_LED_DATA_SIZE: u8 = 0x1D;
-pub(crate) const DOCK_LED_ZONES: usize = 8;
-pub(crate) const DOCK_LED_COUNT_MINUS_ONE: u8 = (DOCK_LED_ZONES as u8) - 1;
+pub(crate) const DOCK_LED_ZONES: u8 = 8;
+pub(crate) const DOCK_LED_COUNT_MINUS_ONE: u8 = DOCK_LED_ZONES - 1;
 
 // Basilisk V3 Pro 35K LED layout when routed via the dock.
 pub(crate) const MOUSE_LED_DATA_SIZE: u8 = 0x2C;
-pub(crate) const MOUSE_LED_ZONES: usize = 13;
-pub(crate) const MOUSE_LED_COUNT_MINUS_ONE: u8 = (MOUSE_LED_ZONES as u8) - 1;
+pub(crate) const MOUSE_LED_ZONES: u8 = 13;
+pub(crate) const MOUSE_LED_COUNT_MINUS_ONE: u8 = MOUSE_LED_ZONES - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Rgb {
@@ -95,7 +95,7 @@ pub(crate) fn compute_crc(bytes: &[u8; REPORT_LEN]) -> u8 {
 
 /// Populate the common fixed-size header used by all LED matrix reports and
 /// return the byte index at which the per-LED RGB triplets begin.
-fn write_matrix_header(
+const fn write_matrix_header(
     bytes: &mut [u8; REPORT_LEN],
     tx_id: u8,
     data_size: u8,
@@ -109,8 +109,8 @@ fn write_matrix_header(
     13
 }
 
-fn fill_leds(bytes: &mut [u8; REPORT_LEN], start: usize, zones: usize, color: Rgb) {
-    for i in 0..zones {
+fn fill_leds(bytes: &mut [u8; REPORT_LEN], start: usize, zones: u8, color: Rgb) {
+    for i in 0..usize::from(zones) {
         let o = start + i * 3;
         bytes[o] = color.red;
         bytes[o + 1] = color.green;
@@ -217,7 +217,8 @@ pub(crate) fn query_battery(dock: &HidrawDevice) -> Result<BatteryStatus> {
 
 /// Razer reports battery as 0..=255; rescale to 0..=100 (truncating).
 fn parse_battery_percent(raw: u8) -> u8 {
-    ((raw as u32 * 100) / 255) as u8
+    // 255 * 100 / 255 = 100, so the conversion back never actually saturates.
+    u8::try_from(u32::from(raw) * 100 / 255).unwrap_or(100)
 }
 
 pub(crate) fn query_serial(dock: &HidrawDevice, tx_id: u8) -> Result<String> {
@@ -278,7 +279,7 @@ impl std::fmt::Display for ProfileInfo {
 }
 
 /// Color shown by the mouse's profile indicator LED for each slot.
-fn profile_color_name(slot: u8) -> Option<&'static str> {
+const fn profile_color_name(slot: u8) -> Option<&'static str> {
     match slot {
         1 => Some("white"),
         2 => Some("red"),
@@ -362,11 +363,12 @@ impl std::fmt::Display for DpiStages {
         // Not the open-padlock glyph: it is indistinguishable from 🔒 in
         // some terminal fonts. The cycle arrows say what the button does.
         write!(f, "🔄 on — ")?;
-        for (i, &stage) in self.stages.iter().enumerate() {
-            if i > 0 {
+        // Stage numbers are 1-based, like `active`.
+        for (number, &stage) in (1u8..).zip(&self.stages) {
+            if number > 1 {
                 f.write_str("/")?;
             }
-            if (i + 1) as u8 == self.active {
+            if number == self.active {
                 write!(f, "[{}]", format_dpi(stage))?;
             } else {
                 f.write_str(&format_dpi(stage))?;
@@ -410,7 +412,7 @@ pub(crate) fn query_dpi_stages(dock: &HidrawDevice) -> Result<DpiStages> {
 
 /// "live" / "stored" for error messages, so a failure between the two writes
 /// says which slot was left untouched.
-fn slot_name(store: u8) -> &'static str {
+const fn slot_name(store: u8) -> &'static str {
     if store == LIVESTORE { "live" } else { "stored" }
 }
 
@@ -451,10 +453,13 @@ pub(crate) fn set_dpi_stages(dock: &HidrawDevice, active: u8, stages: &[u16]) ->
 /// `[store, active_stage, count]`, then 7 bytes per stage: 1-based index,
 /// X and Y big-endian (same value on both axes), two reserved zero bytes.
 fn dpi_stages_args(store: u8, active: u8, stages: &[u16]) -> Vec<u8> {
-    let mut args = vec![store, active, stages.len() as u8];
-    for (i, dpi) in stages.iter().enumerate() {
+    // An oversized table could not be sent anyway: `build_query` rejects
+    // arguments that overflow the report long before 255 stages.
+    let count = u8::try_from(stages.len()).expect("stage table fits one report");
+    let mut args = vec![store, active, count];
+    for (number, dpi) in (1u8..).zip(stages) {
         let [hi, lo] = dpi.to_be_bytes();
-        args.extend_from_slice(&[(i + 1) as u8, hi, lo, hi, lo, 0x00, 0x00]);
+        args.extend_from_slice(&[number, hi, lo, hi, lo, 0x00, 0x00]);
     }
     args
 }
@@ -485,7 +490,7 @@ mod tests {
             0x00, 0xF7, 0x00, 0x00, 0x00, 0x1D, 0x0F, 0x03, 0x00, 0x00, 0x00, 0x00, 0x07,
         ];
         assert_eq!(&bytes[..expected_prefix.len()], &expected_prefix);
-        for i in 0..DOCK_LED_ZONES {
+        for i in 0..usize::from(DOCK_LED_ZONES) {
             assert_eq!(bytes[13 + i * 3], 0xC0);
             assert_eq!(bytes[14 + i * 3], 0x00);
             assert_eq!(bytes[15 + i * 3], 0x00);
@@ -502,13 +507,13 @@ mod tests {
         assert_eq!(bytes[6], CLASS_EXTENDED_MATRIX);
         assert_eq!(bytes[7], CMD_SET_MATRIX_EFFECT);
         assert_eq!(bytes[12], MOUSE_LED_COUNT_MINUS_ONE);
-        for i in 0..MOUSE_LED_ZONES {
+        for i in 0..usize::from(MOUSE_LED_ZONES) {
             assert_eq!(bytes[13 + i * 3], 0x00);
             assert_eq!(bytes[14 + i * 3], 0x00);
             assert_eq!(bytes[15 + i * 3], 0xC0);
         }
         // Zones past MOUSE_LED_ZONES must remain zero.
-        assert_eq!(bytes[13 + MOUSE_LED_ZONES * 3], 0x00);
+        assert_eq!(bytes[13 + usize::from(MOUSE_LED_ZONES) * 3], 0x00);
         assert_eq!(bytes[88], compute_crc(&bytes));
     }
 

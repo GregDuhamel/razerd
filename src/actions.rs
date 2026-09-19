@@ -62,6 +62,9 @@ const BATTERY_ABSENT_RETRY: Duration = Duration::from_secs(10);
 const BATTERY_UNANSWERED_RETRY: Duration = Duration::from_secs(3);
 const BATTERY_WITHDRAW_AFTER: Duration = Duration::from_secs(10);
 
+// `run_check` and `run_info` cannot fail, but every action keeps the same
+// signature so `main` dispatches them uniformly.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn run_check(dock: &HidrawDevice) -> Result<()> {
     println!(
         "✓ Razer Mouse Dock Pro ({}) accessible",
@@ -315,24 +318,21 @@ fn mirror_until_silent(
         let status = poll_battery(dock)?;
         let now = Instant::now();
         schedule.on_polled(now, status.is_some());
-        match status {
-            Some(status) => {
-                // Pushed even when unchanged: each push past the kernel's
-                // 30 s rate-limit re-announces the battery to UPower.
-                device.update(status.percent, status.charging)?;
-                silent_since = None;
-                if status != last {
-                    println!("battery: {status}");
-                    last = status;
-                }
+        if let Some(status) = status {
+            // Pushed even when unchanged: each push past the kernel's 30 s
+            // rate-limit re-announces the battery to UPower.
+            device.update(status.percent, status.charging)?;
+            silent_since = None;
+            if status != last {
+                println!("battery: {status}");
+                last = status;
             }
-            None => {
-                let since = *silent_since.get_or_insert(now);
-                if should_withdraw_battery(now.duration_since(since)) {
-                    return Ok(());
-                }
-                // A lost poll so far: keep the last reading, retry shortly.
+        } else {
+            let since = *silent_since.get_or_insert(now);
+            if should_withdraw_battery(now.duration_since(since)) {
+                return Ok(());
             }
+            // A lost poll so far: keep the last reading, retry shortly.
         }
     }
 }
@@ -374,6 +374,7 @@ pub(crate) fn run_battery(dock: &HidrawDevice) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps)] // see `run_check`
 pub(crate) fn run_info(dock: &HidrawDevice) -> Result<()> {
     println!("Razer Mouse Dock Pro");
     println!("  Path:     {}", dock.path.display());
@@ -550,7 +551,7 @@ mod tests {
         assert!(!should_withdraw_battery(Duration::ZERO));
         assert!(!should_withdraw_battery(BATTERY_UNANSWERED_RETRY * 2));
         assert!(!should_withdraw_battery(
-            BATTERY_WITHDRAW_AFTER - Duration::from_millis(1)
+            BATTERY_WITHDRAW_AFTER.saturating_sub(Duration::from_millis(1))
         ));
         assert!(should_withdraw_battery(BATTERY_WITHDRAW_AFTER));
         assert!(should_withdraw_battery(Duration::from_secs(3600)));
@@ -583,7 +584,7 @@ mod tests {
         // Brief pauses in movement must not re-apply.
         assert!(!should_reapply_on_wake(Duration::from_millis(500)));
         assert!(!should_reapply_on_wake(
-            WAKE_IDLE_THRESHOLD - Duration::from_millis(1)
+            WAKE_IDLE_THRESHOLD.saturating_sub(Duration::from_millis(1))
         ));
         // A gap at/above the threshold means the mouse slept → re-apply.
         assert!(should_reapply_on_wake(WAKE_IDLE_THRESHOLD));
