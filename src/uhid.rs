@@ -18,9 +18,8 @@ use anyhow::{Context, Result, bail};
 
 const UHID_PATH: &str = "/dev/uhid";
 
-// `/dev/uhid` is misc (major 10) minor 239 (`UHID_MINOR`); glibc's `makedev`
-// for small numbers is `major << 8 | minor`.
-const UHID_RDEV: u64 = (10 << 8) | 239;
+// `/dev/uhid` is the misc device (major 10) with minor 239 (`UHID_MINOR`).
+const UHID_RDEV: libc::dev_t = libc::makedev(10, 239);
 
 // systemd's fd-passing protocol (sd_listen_fds(3)): passed fds start at 3.
 const SD_LISTEN_FDS_START: i32 = 3;
@@ -83,7 +82,7 @@ const START_SETTLE_DELAY: Duration = Duration::from_millis(250);
 // the window has closed costs one redundant uevent at worst.
 const CHARGE_FLIP_REPUSH_DELAY: Duration = Duration::from_secs(31);
 
-// Errno values for GET/SET_REPORT replies we do not serve.
+// The errno carried by the GET/SET_REPORT replies we do not serve.
 const EIO: u16 = libc::EIO as u16;
 
 /// Report descriptor: one Mouse application collection holding
@@ -93,7 +92,7 @@ const EIO: u16 = libc::EIO as u16;
 ///   the battery with it), and because UPower types a HID battery after its
 ///   sibling input device: `ID_INPUT_MOUSE` makes this one a "mouse".
 /// * report 2 — `[battery strength 0..100, charging bit]`. Strength comes
-///   first: when the kernel has to *query* the level (GET_REPORT) it reads the
+///   first: when the kernel has to *query* the level (`GET_REPORT`) it reads the
 ///   byte right after the report id.
 const BATTERY_MOUSE_DESCRIPTOR: &[u8] = &[
     0x05, 0x01, // Usage Page (Generic Desktop)
@@ -140,6 +139,11 @@ const BATTERY_MOUSE_DESCRIPTOR: &[u8] = &[
     0xC0, //       End Collection
 ];
 
+const _: () = assert!(
+    BATTERY_MOUSE_DESCRIPTOR.len() <= HID_MAX_DESCRIPTOR_SIZE,
+    "report descriptor exceeds the uhid limit"
+);
+
 /// Get a read-write handle on `/dev/uhid`.
 ///
 /// Under systemd the node stays `root:root 0600` and the service manager hands
@@ -169,7 +173,7 @@ pub(crate) fn open() -> Result<File> {
     Ok(file)
 }
 
-/// The single descriptor systemd passed us, if any (sd_listen_fds(3)).
+/// The single descriptor systemd passed us, if any (`sd_listen_fds(3)`).
 fn inherited_fd() -> Option<i32> {
     let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
     let count: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
@@ -190,7 +194,7 @@ pub(crate) struct BatteryDevice {
 impl BatteryDevice {
     /// Create the device with an initial reading.
     pub(crate) fn create(file: File, percent: u8, charging: bool) -> Result<Self> {
-        let mut device = Self {
+        let device = Self {
             file,
             report: battery_report(percent, charging),
             repush_at: None,
@@ -211,7 +215,7 @@ impl BatteryDevice {
     /// Remove the device from the kernel and hand the uhid handle back, ready
     /// for a later `create`. (Simply dropping `self` closes the handle, which
     /// also removes the device — but the handle cannot be reopened.)
-    pub(crate) fn destroy(mut self) -> Result<File> {
+    pub(crate) fn destroy(self) -> Result<File> {
         self.write_event(&UHID_DESTROY.to_ne_bytes())
             .context("UHID_DESTROY failed")?;
         Ok(self.file)
@@ -232,12 +236,12 @@ impl BatteryDevice {
         self.repush_at = Some(self.repush_at.map_or(at, |pending| pending.min(at)));
     }
 
-    fn push(&mut self) -> Result<()> {
+    fn push(&self) -> Result<()> {
         let event = input2_event(&self.report);
         self.write_event(&event).context("UHID_INPUT2 failed")
     }
 
-    /// Answer the kernel's requests until `deadline`. A GET/SET_REPORT blocks
+    /// Answer the kernel's requests until `deadline`. A `GET_REPORT`/`SET_REPORT` blocks
     /// its caller in the kernel (up to 5 s) until we reply, so the handle must
     /// be serviced whenever we are otherwise idle.
     ///
@@ -269,7 +273,8 @@ impl BatteryDevice {
             }
             let wake = self.repush_at.map_or(deadline, |at| at.min(deadline));
             // Round up so we never spin on a sub-millisecond remainder.
-            let timeout_ms = (wake - now)
+            let timeout_ms = wake
+                .saturating_duration_since(now)
                 .as_millis()
                 .saturating_add(1)
                 .min(i32::MAX as u128);
@@ -299,14 +304,11 @@ impl BatteryDevice {
         // Large enough for every header we look at; the kernel truncates the
         // event to the buffer and still consumes it whole.
         let mut ev = [0u8; 16];
-        let n = match (&self.file).read(&mut ev) {
-            Ok(n) => n,
+        match (&self.file).read(&mut ev) {
+            Ok(_) => {}
             // The handle may be non-blocking (systemd opens it that way).
             Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e).context("reading uhid event"),
-        };
-        if n < ev.len() {
-            return Ok(()); // cannot happen: every uhid event is 4 KiB
         }
 
         let kind = u32::from_ne_bytes([ev[0], ev[1], ev[2], ev[3]]);
@@ -330,7 +332,7 @@ impl BatteryDevice {
         }
     }
 
-    fn write_event(&mut self, event: &[u8]) -> Result<()> {
+    fn write_event(&self, event: &[u8]) -> Result<()> {
         // One event per write(); uhid never accepts a partial one.
         let n = (&self.file).write(event)?;
         if n != event.len() {
@@ -343,14 +345,10 @@ impl BatteryDevice {
 /// `[report id, strength, charging]`. The kernel ignores a strength of 0
 /// ("no reading"), so an empty battery is reported as 1 %.
 fn battery_report(percent: u8, charging: bool) -> [u8; 3] {
-    [REPORT_ID_BATTERY, percent.clamp(1, 100), charging as u8]
+    [REPORT_ID_BATTERY, percent.clamp(1, 100), u8::from(charging)]
 }
 
 fn create2_event(name: &str, phys: &str, uniq: &str, descriptor: &[u8]) -> Vec<u8> {
-    assert!(
-        descriptor.len() <= HID_MAX_DESCRIPTOR_SIZE,
-        "report descriptor exceeds the uhid limit"
-    );
     let mut ev = vec![0u8; CREATE2_RD_DATA + descriptor.len()];
     ev[..EV_PAYLOAD].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
     copy_c_string(&mut ev[CREATE2_NAME], name);

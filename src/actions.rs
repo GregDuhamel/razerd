@@ -3,7 +3,7 @@
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::cli::ColorName;
 use crate::hid::{HidrawDevice, is_device_gone};
@@ -47,9 +47,9 @@ const MOTION_GAP: Duration = Duration::from_secs(2);
 // *that* it moves: look at the stream this often and discard the backlog.
 const MOTION_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
-// While no battery is exposed (no reading yet, or withdrawn) retry faster: the
-// mouse is typically asleep when the service starts at boot, and its battery
-// should show up soon after it is first touched.
+// While no battery is exposed (no reading yet, or withdrawn), moving the mouse
+// triggers a query at once — it is typically asleep when the service starts at
+// boot. This cadence only covers a mouse that becomes reachable without moving.
 const BATTERY_ABSENT_RETRY: Duration = Duration::from_secs(10);
 
 // A mouse that stopped answering is asleep, switched off, out of range or
@@ -135,30 +135,12 @@ pub(crate) fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
         color.as_str()
     );
 
-    let mut pfd = libc::pollfd {
-        fd: dock.file.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout_ms = WATCH_SAFETY_INTERVAL.as_millis() as libc::c_int;
-
     let mut buf = [0u8; 256];
     let mut last_input = Instant::now();
     let mut active_since_safety = false;
 
     loop {
-        // SAFETY: one valid pollfd over an owned fd; the kernel only writes
-        // `revents`. A negative return means error, with errno set.
-        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue; // EINTR (benign signal) — just retry the poll
-            }
-            bail!("poll on {} failed: {err}", dock.path.display());
-        }
-
-        if ret == 0 {
+        if !dock.wait_for_input(Instant::now() + WATCH_SAFETY_INTERVAL)? {
             // Safety cadence elapsed. Re-apply only if the mouse has been used
             // since the last safety apply, so a sleeping/absent mouse is free.
             if active_since_safety {
@@ -201,11 +183,6 @@ fn poll_battery(dock: &HidrawDevice) -> Result<Option<BatteryStatus>> {
     }
 }
 
-fn print_battery_reading(status: BatteryStatus) {
-    let suffix = if status.charging { " (charging)" } else { "" };
-    println!("battery: {}%{suffix}", status.percent);
-}
-
 /// Should the exposed battery be withdrawn, `unanswered` after the first poll
 /// of the current silence failed? Not on one lost poll — only once the retries
 /// have kept failing for `BATTERY_WITHDRAW_AFTER`.
@@ -216,7 +193,6 @@ fn should_withdraw_battery(unanswered: Duration) -> bool {
 /// When `--upower` should next query the battery: the slow refresh cadence,
 /// plus polls placed around mouse movement (see `BATTERY_MOTION_START_DELAY`).
 /// Pure bookkeeping over instants, so the policy is testable without hardware.
-#[derive(Debug)]
 struct PollSchedule {
     refresh_at: Instant,
     // Pending "the mouse started moving" poll.
@@ -346,7 +322,7 @@ fn mirror_until_silent(
                 device.update(status.percent, status.charging)?;
                 silent_since = None;
                 if status != last {
-                    print_battery_reading(status);
+                    println!("battery: {status}");
                     last = status;
                 }
             }
@@ -379,7 +355,7 @@ pub(crate) fn run_upower(dock: &HidrawDevice) -> Result<()> {
         let first = wait_for_first_reading(dock)?;
         let mut device = BatteryDevice::create(uhid, first.percent, first.charging)
             .context("cannot create the virtual battery device")?;
-        print_battery_reading(first);
+        println!("battery: {first}");
 
         mirror_until_silent(dock, &mut device, first)?;
 
@@ -394,9 +370,7 @@ pub(crate) fn run_upower(dock: &HidrawDevice) -> Result<()> {
 }
 
 pub(crate) fn run_battery(dock: &HidrawDevice) -> Result<()> {
-    let status = query_battery(dock)?;
-    let suffix = if status.charging { " (charging)" } else { "" };
-    println!("✓ Battery: {}%{}", status.percent, suffix);
+    println!("✓ Battery: {}", query_battery(dock)?);
     Ok(())
 }
 

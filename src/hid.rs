@@ -133,11 +133,12 @@ impl HidrawDevice {
     /// moved" signal without consuming the stream report by report.
     pub(crate) fn wait_for_input(&self, deadline: Instant) -> Result<bool> {
         loop {
+            // Recomputed each turn: a signal cuts a poll short.
             let remaining = deadline.saturating_duration_since(Instant::now());
             if self.poll_input(remaining)? {
                 return Ok(true);
             }
-            if remaining.is_zero() || Instant::now() >= deadline {
+            if remaining.is_zero() {
                 return Ok(false);
             }
         }
@@ -163,10 +164,12 @@ impl HidrawDevice {
             events: libc::POLLIN,
             revents: 0,
         };
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // Rounded up: a sub-millisecond remainder must sleep, not spin.
+        let timeout_ms =
+            timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int;
         // SAFETY: one valid pollfd over an owned fd; the kernel only writes
         // `revents`. A negative return means error, with errno set.
-        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        let ret = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {

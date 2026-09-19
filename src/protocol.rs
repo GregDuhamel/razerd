@@ -178,6 +178,17 @@ pub(crate) struct BatteryStatus {
     pub(crate) charging: bool,
 }
 
+/// `89%`, or `89% (charging)`.
+impl std::fmt::Display for BatteryStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}%", self.percent)?;
+        if self.charging {
+            f.write_str(" (charging)")?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn query_battery(dock: &HidrawDevice) -> Result<BatteryStatus> {
     let level = dock
         .exchange_feature(&build_query(
@@ -528,6 +539,21 @@ mod tests {
         assert_eq!(parse_battery_percent(0), 0);
         assert_eq!(parse_battery_percent(255), 100);
         assert_eq!(parse_battery_percent(127), 49); // integer truncation
+    }
+
+    /// `razerd-battery-notify` parses this text out of `--battery`.
+    #[test]
+    fn battery_status_formats_with_charging_suffix() {
+        let discharging = BatteryStatus {
+            percent: 89,
+            charging: false,
+        };
+        assert_eq!(discharging.to_string(), "89%");
+        let charging = BatteryStatus {
+            percent: 100,
+            charging: true,
+        };
+        assert_eq!(charging.to_string(), "100% (charging)");
     }
 
     #[test]
