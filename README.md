@@ -104,6 +104,8 @@ razerd --watch blue
 
 How it works: the dock emits no dedicated wake event, but it resumes forwarding mouse-motion input reports the instant the mouse comes back. `--watch` waits on that input stream and treats *input resuming after a quiet gap* as a wake, re-applying the color within milliseconds. Each wake re-apply is followed by a second one 2 s later: lifting the mouse off the dock wakes it while it still shows its charging lighting, and the firmware reloads its onboard lighting when it switches to battery power — over the color just sent. While the mouse is in use it also re-applies on a slow safety cadence (every 60s) to correct any spontaneous drift — and it stays completely idle while the mouse is asleep or absent, so there is no periodic wakeup cost.
 
+**If the color is lost every time you touch the mouse** (and comes back a couple of seconds later), check the onboard profile's lighting power-saving in Razer Synapse. With the option that dims the lighting when the mouse is idle enabled on a profile (dim to 25 % here), the firmware restores that profile's own lighting over razerd's color on every motion, even after a short pause. Disable it and save the profile. The setting is per profile — `razerd --info` shows the active one — and it is not visible through the commands razerd uses, so razerd cannot detect it.
+
 Run it as a background service to keep your color persistent — see [Installation](#3-optional-systemd-user-service).
 
 ### Battery in the desktop's power applet: `--upower`
