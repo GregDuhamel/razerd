@@ -102,7 +102,7 @@ razerd --watch blue
 # Watching /dev/hidraw0 — holding 'blue', re-applying on wake. Ctrl-C to stop.
 ```
 
-How it works: the dock emits no dedicated wake event, but it resumes forwarding mouse-motion input reports the instant the mouse comes back. `--watch` waits on that input stream and treats *input resuming after a quiet gap* as a wake, re-applying the color within milliseconds. While the mouse is in use it also re-applies on a slow safety cadence (every 60s) to correct any spontaneous drift — and it stays completely idle while the mouse is asleep or absent, so there is no periodic wakeup cost.
+How it works: the dock emits no dedicated wake event, but it resumes forwarding mouse-motion input reports the instant the mouse comes back. `--watch` waits on that input stream and treats *input resuming after a quiet gap* as a wake, re-applying the color within milliseconds. Each wake re-apply is followed by a second one 2 s later: lifting the mouse off the dock wakes it while it still shows its charging lighting, and the firmware reloads its onboard lighting when it switches to battery power — over the color just sent. While the mouse is in use it also re-applies on a slow safety cadence (every 60s) to correct any spontaneous drift — and it stays completely idle while the mouse is asleep or absent, so there is no periodic wakeup cost.
 
 Run it as a background service to keep your color persistent — see [Installation](#3-optional-systemd-user-service).
 
