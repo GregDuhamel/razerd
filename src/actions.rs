@@ -27,6 +27,13 @@ const WAKE_IDLE_THRESHOLD: Duration = Duration::from_secs(5);
 // sleeping or absent mouse costs nothing.
 const WATCH_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
 
+// A wake re-apply can land too early: lifting the mouse off the dock wakes it
+// while it still shows its charging lighting, and when the firmware then
+// switches to battery power it reloads the onboard profile's lighting over the
+// color just sent. So every wake re-apply is followed by a second one, once
+// that transition is over.
+const WATCH_FOLLOW_UP_DELAY: Duration = Duration::from_secs(2);
+
 // `--upower` refreshes the battery on this slow cadence — enough for the level,
 // which moves slowly. Charging flips are caught by the motion-driven polls
 // below instead; this is the net under them (and what notices "full").
@@ -141,9 +148,21 @@ pub(crate) fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
     let mut buf = [0u8; 256];
     let mut last_input = Instant::now();
     let mut active_since_safety = false;
+    let mut follow_up_at: Option<Instant> = None;
 
     loop {
-        if !dock.wait_for_input(Instant::now() + WATCH_SAFETY_INTERVAL)? {
+        if follow_up_at.is_some_and(|at| Instant::now() >= at) {
+            follow_up_at = None;
+            apply_color(dock, color).context("follow-up re-apply failed")?;
+            println!("re-applied '{}' (follow-up)", color.as_str());
+        }
+
+        let safety_at = Instant::now() + WATCH_SAFETY_INTERVAL;
+        let deadline = follow_up_at.map_or(safety_at, |at| at.min(safety_at));
+        if !dock.wait_for_input(deadline)? {
+            if follow_up_at.is_some() {
+                continue; // woke for the follow-up, not for the safety cadence
+            }
             // Safety cadence elapsed. Re-apply only if the mouse has been used
             // since the last safety apply, so a sleeping/absent mouse is free.
             if active_since_safety {
@@ -167,6 +186,7 @@ pub(crate) fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
 
         if should_reapply_on_wake(idle_gap) {
             apply_color(dock, color).context("wake re-apply failed")?;
+            follow_up_at = Some(now + WATCH_FOLLOW_UP_DELAY);
             println!(
                 "re-applied '{}' (mouse woke after {:.0}s idle)",
                 color.as_str(),
