@@ -1,6 +1,6 @@
 //! The verb behind each CLI flag: one `run_*` function per action.
 
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -12,7 +12,7 @@ use crate::protocol::{
     dock_rgb_report, format_dpi, mouse_via_dock_rgb_report, query_battery, query_dpi,
     query_dpi_stages, query_firmware, query_profiles, query_serial, set_dpi, set_dpi_stages,
 };
-use crate::uhid::{self, BatteryDevice};
+use crate::uhid::{self, Battery, Kind};
 
 // `--watch` re-applies the color when the mouse wakes. The dock emits no
 // dedicated wake event — it just resumes forwarding mouse-motion input reports
@@ -294,7 +294,7 @@ fn wait_for_first_reading(dock: &HidrawDevice) -> Result<BatteryStatus> {
 /// silent for `BATTERY_WITHDRAW_AFTER`.
 fn mirror_until_silent(
     dock: &HidrawDevice,
-    device: &mut BatteryDevice,
+    device: &mut Battery,
     first: BatteryStatus,
 ) -> Result<()> {
     let mut last = first;
@@ -305,14 +305,14 @@ fn mirror_until_silent(
 
     loop {
         let now = Instant::now();
-        let input = schedule.watches_input(now).then_some(dock.file.as_raw_fd());
+        let input = schedule.watches_input(now).then(|| dock.file.as_fd());
         if device.serve_until(schedule.next_wakeup(now), input)? {
             dock.drain_input_reports()?;
             schedule.on_motion(Instant::now());
             continue;
         }
         if Instant::now() < schedule.next_poll_at() {
-            continue; // woke only to look at the input stream again
+            continue; // woke to look at the input stream again, or on a signal
         }
 
         let status = poll_battery(dock)?;
@@ -345,7 +345,8 @@ fn mirror_until_silent(
 /// unplugged); the kernel removes the device when the process exits.
 pub(crate) fn run_upower(dock: &HidrawDevice) -> Result<()> {
     // Fail on a missing uhid handle now, not after waiting on the mouse.
-    let mut uhid = uhid::open()?;
+    let mut handle = uhid::open()?;
+    let identity = uhid::identity();
     println!(
         "Bridging the mouse battery from {} to UPower — waiting for a first reading.",
         dock.path.display()
@@ -353,15 +354,19 @@ pub(crate) fn run_upower(dock: &HidrawDevice) -> Result<()> {
 
     loop {
         let first = wait_for_first_reading(dock)?;
-        let mut device = BatteryDevice::create(uhid, first.percent, first.charging)
-            .context("cannot create the virtual battery device")?;
+        let mut device = Battery::create(
+            handle,
+            &identity,
+            Kind::Mouse,
+            first.percent,
+            first.charging,
+        )
+        .context("cannot create the virtual battery device")?;
         println!("battery: {first}");
 
         mirror_until_silent(dock, &mut device, first)?;
 
-        uhid = device
-            .destroy()
-            .context("cannot withdraw the virtual battery device")?;
+        handle = device.destroy();
         println!(
             "battery withdrawn — mouse silent for {} s (asleep, off or out of range)",
             BATTERY_WITHDRAW_AFTER.as_secs()

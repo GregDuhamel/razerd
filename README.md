@@ -260,7 +260,7 @@ The protocol was reverse-engineered from USB captures of Razer Synapse on Window
 | `src/main.rs` | Module wiring and the flag → action dispatch — nothing else |
 | `src/hid.rs` | Hidraw transport: device discovery via sysfs, feature-report ioctls, the send/poll exchange with its response-correlation check |
 | `src/protocol.rs` | The Razer report layer: 90-byte format, command constants, typed queries/writes (battery, serial, firmware, DPI, stages, profiles) |
-| `src/uhid.rs` | The virtual HID battery behind `--upower`: report descriptor, hand-serialized `uhid` events, systemd fd inheritance |
+| `src/uhid.rs` | The razerd side of the virtual HID battery behind `--upower`: device identity, where the `/dev/uhid` handle comes from, and reading the exposed battery back for `--info`. The uhid mechanism itself is the [`uhid-battery`](https://github.com/GregDuhamel/uhid-battery) crate |
 | `src/cli.rs` | The clap surface: flags, parsers, flag-to-action mapping |
 | `src/actions.rs` | One `run_*` function per flag: the `--watch` loop, the `--upower` loop, the `--info` report, the sensitivity writes |
 | `contrib/razerd-watch.service` | systemd user unit running `razerd --watch` (installed by `make install-watch`) |
@@ -289,6 +289,7 @@ Releases are cut via the **Release** GitHub Action (`workflow_dispatch`) — pic
 - [`clap`](https://github.com/clap-rs/clap) — CLI argument parsing
 - [`anyhow`](https://github.com/dtolnay/anyhow) — error handling
 - [`libc`](https://github.com/rust-lang/libc) — `ioctl` for `HIDIOCSFEATURE`, `poll`
+- [`uhid-battery`](https://github.com/GregDuhamel/uhid-battery) — the virtual HID battery behind `--upower` (git dependency, pinned to a release tag)
 
 ## License
 
