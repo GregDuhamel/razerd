@@ -134,6 +134,71 @@ fn should_reapply_on_wake(idle_gap: Duration) -> bool {
     idle_gap >= WAKE_IDLE_THRESHOLD
 }
 
+/// Which re-applies `--watch` owes at a given instant.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DueReapplies {
+    follow_up: bool,
+    safety: bool,
+}
+
+/// When `--watch` re-applies the color: on a wake, once more after it, and on
+/// the safety tick. Pure bookkeeping over instants, so the policy is testable
+/// without hardware — the tick that never fired during use lived in the I/O
+/// loop, out of any test's reach.
+struct WatchSchedule {
+    last_input: Instant,
+    active_since_safety: bool,
+    follow_up_at: Option<Instant>,
+    // A fixed tick, not "this long after the last input": input arrives by
+    // the thousand per second while the mouse moves, and must not push it back.
+    safety_at: Instant,
+}
+
+impl WatchSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_input: now,
+            active_since_safety: false,
+            follow_up_at: None,
+            safety_at: now + WATCH_SAFETY_INTERVAL,
+        }
+    }
+
+    /// What is due at `now`; taking it re-arms the schedule. A safety tick
+    /// with no input since the previous one owes nothing, so a sleeping or
+    /// absent mouse costs nothing.
+    fn take_due(&mut self, now: Instant) -> DueReapplies {
+        let mut due = DueReapplies::default();
+        if self.follow_up_at.is_some_and(|at| now >= at) {
+            self.follow_up_at = None;
+            due.follow_up = true;
+        }
+        if now >= self.safety_at {
+            self.safety_at = now + WATCH_SAFETY_INTERVAL;
+            due.safety = std::mem::take(&mut self.active_since_safety);
+        }
+        due
+    }
+
+    /// Until when to wait for input before something is due.
+    fn next_deadline(&self) -> Instant {
+        self.follow_up_at
+            .map_or(self.safety_at, |at| at.min(self.safety_at))
+    }
+
+    /// An input report arrived at `now`. Returns the idle gap when it is a
+    /// wake — the color is to be re-applied now, and a follow-up is scheduled.
+    fn on_input(&mut self, now: Instant) -> Option<Duration> {
+        let idle_gap = now.duration_since(self.last_input);
+        self.last_input = now;
+        self.active_since_safety = true;
+        should_reapply_on_wake(idle_gap).then(|| {
+            self.follow_up_at = Some(now + WATCH_FOLLOW_UP_DELAY);
+            idle_gap
+        })
+    }
+}
+
 /// Hold `color` persistently: re-apply it the moment the mouse wakes (detected
 /// as input resuming after a quiet gap) and, while the mouse is in use, on a
 /// slow safety cadence to correct any spontaneous drift. Runs until the process
@@ -147,48 +212,30 @@ pub(crate) fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
     );
 
     let mut buf = [0u8; 256];
-    let mut last_input = Instant::now();
-    let mut active_since_safety = false;
-    let mut follow_up_at: Option<Instant> = None;
-    // A fixed tick, not "this long after the last input": input arrives by
-    // the thousand per second while the mouse moves, and must not push it back.
-    let mut safety_at = Instant::now() + WATCH_SAFETY_INTERVAL;
+    let mut schedule = WatchSchedule::new(Instant::now());
 
     loop {
-        let now = Instant::now();
-        if follow_up_at.is_some_and(|at| now >= at) {
-            follow_up_at = None;
+        let due = schedule.take_due(Instant::now());
+        if due.follow_up {
             apply_color(dock, color).context("follow-up re-apply failed")?;
             println!("re-applied '{}' (follow-up)", color.as_str());
         }
-        if now >= safety_at {
-            safety_at = now + WATCH_SAFETY_INTERVAL;
-            if active_since_safety {
-                active_since_safety = false;
-                apply_color(dock, color).context("safety re-apply failed")?;
-                println!("re-applied '{}' (safety refresh)", color.as_str());
-            }
+        if due.safety {
+            apply_color(dock, color).context("safety re-apply failed")?;
+            println!("re-applied '{}' (safety refresh)", color.as_str());
         }
 
-        let deadline = follow_up_at.map_or(safety_at, |at| at.min(safety_at));
-        if !dock.wait_for_input(deadline)? {
+        if !dock.wait_for_input(schedule.next_deadline())? {
             continue; // a follow-up or the safety tick is due
         }
 
         // Input is ready, so this read won't block. Handling one report per
         // iteration is fine — a burst just makes the next poll return at once.
-        let n = dock.read_input_report(&mut buf)?;
-        if n == 0 {
+        if dock.read_input_report(&mut buf)? == 0 {
             continue;
         }
-        let now = Instant::now();
-        let idle_gap = now.duration_since(last_input);
-        last_input = now;
-        active_since_safety = true;
-
-        if should_reapply_on_wake(idle_gap) {
+        if let Some(idle_gap) = schedule.on_input(Instant::now()) {
             apply_color(dock, color).context("wake re-apply failed")?;
-            follow_up_at = Some(now + WATCH_FOLLOW_UP_DELAY);
             println!(
                 "re-applied '{}' (mouse woke after {:.0}s idle)",
                 color.as_str(),
@@ -620,6 +667,86 @@ mod tests {
         let t3 = t2 + BATTERY_UNANSWERED_RETRY;
         schedule.on_polled(t3, true);
         assert_eq!(schedule.next_poll_at(), t3 + BATTERY_REFRESH_INTERVAL);
+    }
+
+    #[test]
+    fn watch_wake_reapplies_and_owes_one_follow_up() {
+        let t0 = Instant::now();
+        let mut schedule = WatchSchedule::new(t0);
+
+        // Ordinary movement: no wake, nothing scheduled.
+        assert_eq!(schedule.on_input(t0 + Duration::from_secs(1)), None);
+        assert_eq!(schedule.next_deadline(), t0 + WATCH_SAFETY_INTERVAL);
+
+        // Input after a real gap is a wake, reported with its idle time.
+        let wake = t0 + Duration::from_secs(1) + WAKE_IDLE_THRESHOLD;
+        assert_eq!(schedule.on_input(wake), Some(WAKE_IDLE_THRESHOLD));
+        assert_eq!(schedule.next_deadline(), wake + WATCH_FOLLOW_UP_DELAY);
+
+        // The follow-up is owed once, at its time — not before, not twice.
+        assert_eq!(
+            schedule.take_due(wake + Duration::from_secs(1)),
+            DueReapplies::default()
+        );
+        let follow_up = schedule.take_due(wake + WATCH_FOLLOW_UP_DELAY);
+        assert!(follow_up.follow_up && !follow_up.safety);
+        assert_eq!(
+            schedule.take_due(wake + WATCH_FOLLOW_UP_DELAY),
+            DueReapplies::default()
+        );
+    }
+
+    /// Regression: the dock streams ~1000 reports/s while the mouse moves, and
+    /// the tick used to be re-armed by each of them — it never fired during use.
+    #[test]
+    fn watch_safety_tick_is_not_postponed_by_continuous_input() {
+        let t0 = Instant::now();
+        let mut schedule = WatchSchedule::new(t0);
+        let step = Duration::from_millis(50);
+        let mut now = t0;
+        while now + step < t0 + WATCH_SAFETY_INTERVAL {
+            now += step;
+            assert_eq!(schedule.on_input(now), None);
+            assert_eq!(schedule.take_due(now), DueReapplies::default());
+            assert_eq!(schedule.next_deadline(), t0 + WATCH_SAFETY_INTERVAL);
+        }
+
+        let tick = t0 + WATCH_SAFETY_INTERVAL;
+        assert!(schedule.take_due(tick).safety);
+        // Re-armed from the tick, and the next one is just as punctual.
+        assert_eq!(schedule.next_deadline(), tick + WATCH_SAFETY_INTERVAL);
+        schedule.on_input(tick + step);
+        assert!(schedule.take_due(tick + WATCH_SAFETY_INTERVAL).safety);
+    }
+
+    #[test]
+    fn watch_safety_tick_owes_nothing_without_input() {
+        let t0 = Instant::now();
+        let mut schedule = WatchSchedule::new(t0);
+        // Asleep or absent: the tick passes, nothing is sent, and it re-arms.
+        let tick = t0 + WATCH_SAFETY_INTERVAL;
+        assert_eq!(schedule.take_due(tick), DueReapplies::default());
+        assert_eq!(schedule.next_deadline(), tick + WATCH_SAFETY_INTERVAL);
+
+        // One input is enough for the next tick to refresh — once.
+        schedule.on_input(tick + Duration::from_secs(1));
+        assert!(schedule.take_due(tick + WATCH_SAFETY_INTERVAL).safety);
+        assert_eq!(
+            schedule.take_due(tick + WATCH_SAFETY_INTERVAL * 2),
+            DueReapplies::default()
+        );
+    }
+
+    #[test]
+    fn watch_follow_up_and_safety_can_fall_due_together() {
+        let t0 = Instant::now();
+        let mut schedule = WatchSchedule::new(t0);
+        let wake = t0 + WATCH_SAFETY_INTERVAL - Duration::from_secs(1);
+        assert!(schedule.on_input(wake).is_some());
+        // The tick (t0 + 60 s) comes before the follow-up (wake + 2 s).
+        assert_eq!(schedule.next_deadline(), t0 + WATCH_SAFETY_INTERVAL);
+        let due = schedule.take_due(wake + WATCH_FOLLOW_UP_DELAY);
+        assert!(due.follow_up && due.safety);
     }
 
     #[test]

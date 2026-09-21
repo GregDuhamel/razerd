@@ -328,10 +328,16 @@ pub(crate) fn query_dpi(dock: &HidrawDevice) -> Result<(u16, u16)> {
             &[LIVESTORE],
         ))
         .context("DPI query failed")?;
-    Ok((
+    Ok(parse_dpi(&resp))
+}
+
+/// X and Y as big-endian u16 pairs, after the store byte — the mirror of
+/// `set_dpi_query`.
+fn parse_dpi(resp: &[u8; REPORT_LEN]) -> (u16, u16) {
+    (
         u16::from_be_bytes([resp[9], resp[10]]),
         u16::from_be_bytes([resp[11], resp[12]]),
-    ))
+    )
 }
 
 /// `1800` when both axes match, `1600 / 800` when they differ.
@@ -420,18 +426,23 @@ const fn slot_name(store: u8) -> &'static str {
 /// big-endian u16 pairs (same layout as the GET response); we drive both axes
 /// with the same value.
 pub(crate) fn set_dpi(dock: &HidrawDevice, dpi: u16) -> Result<()> {
-    let [hi, lo] = dpi.to_be_bytes();
     for store in [LIVESTORE, VARSTORE] {
-        dock.exchange_feature(&build_query(
-            TX_ID_MOUSE,
-            CLASS_DPI,
-            CMD_SET_DPI,
-            0x07,
-            &[store, hi, lo, hi, lo],
-        ))
-        .with_context(|| format!("DPI set failed ({} slot)", slot_name(store)))?;
+        dock.exchange_feature(&set_dpi_query(store, dpi))
+            .with_context(|| format!("DPI set failed ({} slot)", slot_name(store)))?;
     }
     Ok(())
+}
+
+/// `[store, X be, Y be]` with the same value on both axes.
+fn set_dpi_query(store: u8, dpi: u16) -> [u8; REPORT_LEN] {
+    let [hi, lo] = dpi.to_be_bytes();
+    build_query(
+        TX_ID_MOUSE,
+        CLASS_DPI,
+        CMD_SET_DPI,
+        0x07,
+        &[store, hi, lo, hi, lo],
+    )
 }
 
 /// Write the onboard stage table (the one the Cycle Up Sensitivity Stages
@@ -575,8 +586,8 @@ mod tests {
         let mut resp = [0u8; REPORT_LEN];
         resp[8] = 0xFF; // invalid UTF-8 start byte
         resp[9] = b'A';
-        // Should not panic; lossy conversion replaces invalid bytes.
-        let _ = parse_serial(&resp);
+        // Lossy conversion: the invalid byte is replaced, the rest is kept.
+        assert_eq!(parse_serial(&resp), "\u{FFFD}A");
     }
 
     #[test]
@@ -587,13 +598,7 @@ mod tests {
 
     #[test]
     fn set_dpi_query_layout_is_big_endian_both_axes() {
-        let q = build_query(
-            TX_ID_MOUSE,
-            CLASS_DPI,
-            CMD_SET_DPI,
-            0x07,
-            &[VARSTORE, 0x07, 0x08, 0x07, 0x08],
-        );
+        let q = set_dpi_query(VARSTORE, 1800);
         assert_eq!(q[1], TX_ID_MOUSE);
         assert_eq!(q[5], 0x07);
         assert_eq!(q[6], CLASS_DPI);
@@ -601,6 +606,18 @@ mod tests {
         // varstore, then 1800 (0x0708) big-endian on both axes.
         assert_eq!(&q[8..13], &[0x01, 0x07, 0x08, 0x07, 0x08]);
         assert_eq!(q[88], compute_crc(&q));
+    }
+
+    #[test]
+    fn parse_dpi_reads_back_what_set_dpi_writes() {
+        // The GET response has the SET arguments' layout: store, X, Y.
+        let mut resp = [0u8; REPORT_LEN];
+        resp[8..13].copy_from_slice(&set_dpi_query(LIVESTORE, 1800)[8..13]);
+        assert_eq!(parse_dpi(&resp), (1800, 1800));
+
+        // Axes are decoded independently.
+        resp[11..13].copy_from_slice(&800u16.to_be_bytes());
+        assert_eq!(parse_dpi(&resp), (1800, 800));
     }
 
     #[test]

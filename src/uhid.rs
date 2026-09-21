@@ -105,7 +105,10 @@ mod tests {
 
     #[test]
     fn exposed_battery_attributes_are_read_and_trimmed() {
-        let dir = std::env::temp_dir().join(format!("razerd-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "razerd-test-exposed-battery-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("capacity"), "56\n").unwrap();
         std::fs::write(dir.join("status"), "Discharging\n").unwrap();
