@@ -204,6 +204,8 @@ make install-watch
 
 Installs and enables `razerd-watch.service`, a single long-running process (`razerd --watch blue`) that re-applies the color **the moment the mouse wakes** and stays idle otherwise — no fixed-interval churn. See [Holding a color: `--watch`](#holding-a-color---watch).
 
+The unit is sandboxed: no capabilities, no sockets, a read-only filesystem, a system-call allow-list (`systemd-analyze --user security razerd-watch.service`). A user unit gets that from unprivileged user namespaces; the `razerd` group survives them, so the dock stays reachable. If your system forbids user namespaces the start fails with `status=226/NAMESPACE` — drop the `Protect*`/`Private*` lines with `systemctl --user edit razerd-watch.service`.
+
 **Change the color**:
 
 ```bash
@@ -231,7 +233,7 @@ Installs and enables `razerd-battery.service`, a **system** service running `raz
 - `/dev/uhid` stays `root:root 0600`. No udev rule, no group — your account and the `razerd` group gain nothing.
 - The service manager opens the node itself and passes the descriptor to the service (`OpenFile=/dev/uhid:uhid`; razerd takes it by that name). Closing it — the process exiting for any reason — makes the kernel remove the virtual device. On SELinux systems (Fedora) the stock policy does not let systemd do that, so `make install-battery` also loads a one-rule policy module, `contrib/razerd-uhid.cil`: `init_t` — PID 1's own domain, nothing else — may `open read write` `uhid_device_t` (what one `O_RDWR` open is checked against). It is not what keeps your account out of uhid (that is the node's `0600`, untouched), and a root process in `init_t` could already reach uhid by exec'ing into an unconfined domain — so the rule removes no effective barrier.
 - The process runs as a throwaway unprivileged user (`DynamicUser=yes`) with no capabilities, no network, no sockets (not even D-Bus), a read-only filesystem, and a closed device allow-list: the dock's hidraw (through the `razerd` group of step 2), plus `/dev/uhid` itself — required for systemd to open it on the service's behalf, and useless to the process, which has neither the ownership nor a capability to get past `0600`. Check the result with `systemd-analyze security razerd-battery.service`.
-- System calls are an allow-list (`@default @basic-io @io-event @file-system @signal` + `ioctl`) rather than the usual broad `@system-service`.
+- System calls are an allow-list (`@default @basic-io @io-event @file-system @signal` + `ioctl`) rather than the usual broad `@system-service`, and the unit is capped at 4 tasks and 32 MB.
 - In the code, the report descriptor and the device identity are compile-time constants, and the only values ever written to the virtual device are a percentage and a charging bit — no string from the dock, and no code path that emits a key, a button or motion. Its only inputs are fixed-size replies from the dock and fixed-size events from the kernel.
 
 ## How it works
@@ -273,6 +275,7 @@ Unit tests live next to what they test (`mod tests` per module). One hardware-ga
 
 ```bash
 make build                # cargo build --release
+make check                # what CI runs: fmt, check, clippy, test, doc
 sudo make install         # copy to /usr/local/bin (never builds)
 make install-watch        # enable the --watch systemd user service
 sudo make install-battery # enable the --upower systemd system service

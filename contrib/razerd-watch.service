@@ -1,13 +1,43 @@
 [Unit]
 Description=Razer RGB color hold (re-applies on wireless mouse wake)
+Documentation=https://github.com/GregDuhamel/razerd#holding-a-color---watch
 
 [Service]
 # Long-running: blocks on the dock's input stream and re-applies the color
 # the moment the mouse wakes, instead of re-firing on a fixed timer.
-Type=simple
+# Type=exec: a missing binary fails the start instead of a "started" unit.
+Type=exec
 ExecStart=/usr/local/bin/razerd --watch blue
 Restart=on-failure
 RestartSec=5
+
+# It talks to the dock's hidraw (through the razerd group of the udev rule)
+# and nothing else. A user unit gets its sandbox from unprivileged user
+# namespaces and seccomp; the razerd group survives them, so the dock stays
+# reachable. If your system forbids user namespaces (start fails with
+# status=226/NAMESPACE), drop the Protect*/Private* lines in an override.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=none
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+KeyringMode=private
+UMask=0077
+SystemCallArchitectures=native
+SystemCallFilter=@default @basic-io @io-event @file-system @signal ioctl
 
 [Install]
 WantedBy=default.target
