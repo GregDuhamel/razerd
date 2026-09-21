@@ -22,8 +22,9 @@ use crate::uhid::{self, Battery, Kind};
 const WAKE_IDLE_THRESHOLD: Duration = Duration::from_secs(5);
 
 // While the mouse is in use we also re-apply the color on this cadence, as a
-// safety net against the firmware drifting back to its onboard default for no
-// visible reason. We skip it entirely when the mouse has been idle, so a
+// safety net against the firmware going back to its onboard lighting without
+// a wake we can see (a pause shorter than `WAKE_IDLE_THRESHOLD`, a profile
+// switch). A tick with no input since the previous one is skipped, so a
 // sleeping or absent mouse costs nothing.
 const WATCH_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -149,28 +150,29 @@ pub(crate) fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
     let mut last_input = Instant::now();
     let mut active_since_safety = false;
     let mut follow_up_at: Option<Instant> = None;
+    // A fixed tick, not "this long after the last input": input arrives by
+    // the thousand per second while the mouse moves, and must not push it back.
+    let mut safety_at = Instant::now() + WATCH_SAFETY_INTERVAL;
 
     loop {
-        if follow_up_at.is_some_and(|at| Instant::now() >= at) {
+        let now = Instant::now();
+        if follow_up_at.is_some_and(|at| now >= at) {
             follow_up_at = None;
             apply_color(dock, color).context("follow-up re-apply failed")?;
             println!("re-applied '{}' (follow-up)", color.as_str());
         }
-
-        let safety_at = Instant::now() + WATCH_SAFETY_INTERVAL;
-        let deadline = follow_up_at.map_or(safety_at, |at| at.min(safety_at));
-        if !dock.wait_for_input(deadline)? {
-            if follow_up_at.is_some() {
-                continue; // woke for the follow-up, not for the safety cadence
-            }
-            // Safety cadence elapsed. Re-apply only if the mouse has been used
-            // since the last safety apply, so a sleeping/absent mouse is free.
+        if now >= safety_at {
+            safety_at = now + WATCH_SAFETY_INTERVAL;
             if active_since_safety {
-                apply_color(dock, color).context("safety re-apply failed")?;
                 active_since_safety = false;
+                apply_color(dock, color).context("safety re-apply failed")?;
                 println!("re-applied '{}' (safety refresh)", color.as_str());
             }
-            continue;
+        }
+
+        let deadline = follow_up_at.map_or(safety_at, |at| at.min(safety_at));
+        if !dock.wait_for_input(deadline)? {
+            continue; // a follow-up or the safety tick is due
         }
 
         // Input is ready, so this read won't block. Handling one report per
@@ -410,9 +412,9 @@ pub(crate) fn run_info(dock: &HidrawDevice) -> Result<()> {
     println!("Razer Basilisk V3 Pro 35K (via Dock)");
     println!("  Path:     {}", dock.path.display());
 
-    // The serial doubles as a liveness probe: a sleeping mouse answers no RF
-    // query, so each one would burn its full timeout. After a first miss,
-    // report the remaining fields as absent without further round-trips.
+    // The serial doubles as a liveness probe: a mouse that is asleep or off
+    // answers no RF query. After a first miss, report the remaining fields as
+    // absent without further round-trips.
     let serial = query_serial(dock, TX_ID_MOUSE).ok();
     let awake = serial.is_some();
     print_field("Serial", serial);
