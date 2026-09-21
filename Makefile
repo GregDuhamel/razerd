@@ -1,4 +1,4 @@
-.PHONY: build install uninstall install-watch uninstall-watch install-battery uninstall-battery clean
+.PHONY: build check install uninstall install-watch uninstall-watch install-battery uninstall-battery clean
 
 # System-wide by default: the binary must be root-owned, because
 # razerd-battery.service (a system unit holding a /dev/uhid descriptor) runs
@@ -16,11 +16,20 @@ BATTERY_UNIT    := $(SYSTEM_UNIT_DIR)/razerd-battery.service
 # The units in contrib/ hard-code /usr/local/bin; follow PREFIX when it differs.
 install_unit = sed 's|/usr/local/bin|$(BINDIR)|g' $(1) | install -Dm 0644 /dev/stdin $(2)
 
+require_root = @if [ "$$(id -u)" != 0 ]; then echo "✗ '$@' manages a system unit — run it with sudo"; exit 1; fi
 require_user = @if [ "$$(id -u)" = 0 ]; then echo "✗ '$@' manages your user units — run it without sudo"; exit 1; fi
 require_bin  = @if [ ! -x $(BIN) ]; then echo "✗ $(BIN) not found — run 'make build && sudo make install' first"; exit 1; fi
 
 build:
 	cargo build --release
+
+# What CI runs, locally.
+check:
+	cargo fmt --all -- --check
+	cargo check --locked --all-targets
+	cargo clippy --locked --all-targets -- -D warnings
+	cargo test --locked --all-targets
+	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
 
 # No dependency on `build`: this runs under sudo, and cargo must not.
 install:
@@ -52,6 +61,7 @@ uninstall-watch:
 
 # System unit: run with sudo.
 install-battery:
+	$(require_root)
 	$(require_bin)
 	@if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then \
 		echo "SELinux: installing the razerd-uhid policy module (takes a few seconds)"; \
@@ -65,6 +75,7 @@ install-battery:
 	@echo "  Logs: journalctl -u razerd-battery.service"
 
 uninstall-battery:
+	$(require_root)
 	-systemctl disable --now razerd-battery.service
 	rm -f $(BATTERY_UNIT)
 	systemctl daemon-reload

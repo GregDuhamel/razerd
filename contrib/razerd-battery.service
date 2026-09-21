@@ -1,8 +1,10 @@
 [Unit]
 Description=Razer mouse battery bridge to UPower (virtual HID battery)
+Documentation=https://github.com/GregDuhamel/razerd#battery-in-the-desktops-power-applet---upower
 
 [Service]
-Type=simple
+# Type=exec: a missing binary fails the start instead of a "started" unit.
+Type=exec
 ExecStart=/usr/local/bin/razerd --upower
 # Exits when the dock is unplugged; come back once it is plugged in again.
 Restart=on-failure
@@ -39,7 +41,8 @@ ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-ProtectClock=yes
+# No ProtectClock=: it would add the RTC to the device allow-list, and what it
+# guards is already out of reach (no capability, no @clock system call).
 ProtectHostname=yes
 MemoryDenyWriteExecute=yes
 RestrictNamespaces=yes
@@ -53,6 +56,10 @@ SystemCallArchitectures=native
 # Allow-list, not the usual @system-service: everything the process does is
 # read/write/poll/ioctl on two descriptors plus sysfs discovery of the dock.
 SystemCallFilter=@default @basic-io @io-event @file-system @signal ioctl
+
+# One thread and a few MB (peak measured: 5 MB) — anything beyond is a bug.
+TasksMax=4
+MemoryMax=32M
 
 [Install]
 WantedBy=multi-user.target
