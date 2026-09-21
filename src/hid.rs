@@ -165,8 +165,8 @@ impl HidrawDevice {
             revents: 0,
         };
         // Rounded up: a sub-millisecond remainder must sleep, not spin.
-        let timeout_ms =
-            timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int;
+        let timeout_ms = libc::c_int::try_from(timeout.as_nanos().div_ceil(1_000_000))
+            .unwrap_or(libc::c_int::MAX);
         // SAFETY: one valid pollfd over an owned fd; the kernel only writes
         // `revents`. A negative return means error, with errno set.
         let ret = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
