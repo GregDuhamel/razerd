@@ -2,7 +2,7 @@
 
 Minimal RGB daemon for Razer peripherals on Linux.
 
-Controls the LED color of the **Razer Mouse Dock Pro** and a wirelessly connected **Razer Basilisk V3 Pro 35K** simultaneously, without requiring OpenRazer or any Razer software. It also sets the mouse sensitivity and publishes the mouse battery to UPower, so it shows up in the desktop's power applet like any other wireless peripheral (tested with KDE Plasma).
+Controls the LED color of the **Razer Mouse Dock Pro** and a wirelessly connected **Razer Basilisk V3 Pro 35K** simultaneously, without requiring OpenRazer or any Razer software. It also sets the mouse sensitivity and publishes the mouse battery to UPower, so it shows up in the desktop's power applet like any other wireless peripheral (tested with KDE Plasma). Deployed, it is one daemon (`razerd --upower --hold <color>`) that udev starts when the dock is plugged in — see [Deploying](#deploying).
 
 ## Supported devices
 
@@ -17,8 +17,8 @@ razerd talks exclusively to the dock: every command is sent to it, and the dock 
 
 ```
 razerd --color <COLOR>
+razerd --upower [--hold <COLOR>]
 razerd --watch <COLOR>
-razerd --upower
 razerd --sensitivity <DPI>
 razerd --sensitivity-stages <on|off>
 razerd --check
@@ -32,8 +32,9 @@ razerd --sniff
 | Flag | Description |
 |---|---|
 | `--color red\|green\|blue\|white\|off` | Apply color to dock and mouse once |
-| `--watch red\|green\|blue\|white\|off` | Hold a color, re-applying it whenever the mouse wakes (runs until stopped) |
-| `--upower` | Expose the mouse battery to UPower, and so to the desktop's power applet, through a virtual HID device (runs until stopped — meant for `razerd-battery.service`) |
+| `--upower` | The daemon: expose the mouse battery to UPower, and so to the desktop's power applet, through a virtual HID device (runs until stopped — meant for `razerd.service`) |
+| `--hold red\|green\|blue\|white\|off` | With `--upower`: also hold a color, re-applying it whenever the mouse wakes — `--watch`, in the same process as the battery bridge |
+| `--watch red\|green\|blue\|white\|off` | Hold a color, re-applying it whenever the mouse wakes, without the battery bridge (runs until stopped — the standalone alternative to `--upower --hold`) |
 | `--sensitivity <value>` (alias `--dpi`) | Set the sensitivity to one fixed DPI value (100–35000), disabling the Cycle Up Sensitivity Stages button |
 | `--sensitivity-stages on\|off` | `on`: install the 5-stage table (400/800/1600/3200/6400) and enable the Cycle Up Sensitivity Stages button; `off`: freeze the current DPI and disable it |
 | `--check` | Verify the dock is detected and accessible, and that the mouse answers over RF |
@@ -89,24 +90,24 @@ UPower battery (virtual HID device, via --upower)
 
 The `Stages` line is the sensitivity lock indicator: `🔒 off` means the stage table holds a single value and the Cycle Up Sensitivity Stages button is inert; `🔄 on` lists the stages the button cycles, with the active one in brackets (e.g. `400/800/[1600]/3200/6400`).
 
-The last block is the battery a running [`--upower`](#battery-in-the-desktops-power-applet---upower) currently exposes, read back from sysfs — exactly what UPower and the desktop's power applet see, so a mismatch with the mouse's own `Battery` line points at the bridge. It reads `Path: — (not exposed: bridge not running, or mouse silent)` when `razerd-battery.service` is stopped or has withdrawn the battery.
+The last block is the battery a running [`--upower`](#battery-in-the-desktops-power-applet---upower) currently exposes, read back from sysfs — exactly what UPower and the desktop's power applet see, so a mismatch with the mouse's own `Battery` line points at the bridge. It reads `Path: — (not exposed: bridge not running, or mouse silent)` when `razerd.service` is stopped or has withdrawn the battery.
 
 The mouse stores 5 onboard profiles, cycled with the button on its underside; the indicator LED next to it shows the active slot's color (1 white, 2 red, 3 green, 4 blue, 5 cyan). `--info` reports the active slot.
 
-### Holding a color: `--watch`
+### Holding a color: `--hold` and `--watch`
 
-A wireless mouse forgets its color when it goes to sleep, and its firmware restores the onboard profile's lighting over it at other moments too. `--watch` keeps a long-running process that re-applies the color **the moment the mouse wakes**, instead of re-firing on a fixed timer.
+A wireless mouse forgets its color when it goes to sleep, and its firmware restores the onboard profile's lighting over it at other moments too. Holding a color means a long-running process that re-applies it **the moment the mouse wakes**, instead of re-firing on a fixed timer. The daemon does it with `--upower --hold <color>` (what `razerd.service` runs — see [Deploying](#deploying)); `--watch <color>` does the same thing alone, without the battery bridge, for a system without `/dev/uhid` or a user unit of your own.
 
 ```bash
 razerd --watch blue
 # Watching /dev/hidraw0 — holding 'blue', re-applying on wake. Ctrl-C to stop.
 ```
 
-How it works: the dock emits no dedicated wake event, but it resumes forwarding mouse-motion input reports the instant the mouse comes back. `--watch` waits on that input stream and treats *input resuming after a quiet gap* (5 s or more) as a wake, re-applying the color at once. Each wake re-apply is followed by a second one 2 s later: lifting the mouse off the dock wakes it while it still shows its charging lighting, and the firmware reloads its onboard lighting when it switches to battery power — over the color just sent. While the mouse is in use it also re-applies on a slow safety cadence (every 60 s), the net for what wake detection cannot see — a pause shorter than that gap, a profile switch — and it stays completely idle while the mouse is asleep or absent, so there is no periodic wakeup cost.
+How it works: the dock emits no dedicated wake event, but it resumes forwarding mouse-motion input reports the instant the mouse comes back. The daemon waits on that input stream and treats *input resuming after a quiet gap* (5 s or more) as a wake, re-applying the color at once. Each wake re-apply is followed by a second one 2 s later: lifting the mouse off the dock wakes it while it still shows its charging lighting, and the firmware reloads its onboard lighting when it switches to battery power — over the color just sent. While the mouse is in use it also re-applies on a slow safety cadence (every 60 s), the net for what wake detection cannot see — a pause shorter than that gap, a profile switch — and it stays completely idle while the mouse is asleep or absent, so there is no periodic wakeup cost.
+
+**Why one process.** The dock firmware has a single report buffer and no transaction ids, so two processes talking to it corrupt each other: a color written during a battery query leaves the query reading a foreign header, and a query in flight has the color command refused (`EPIPE`). Both are triggered by the same mouse movement, so they collided often. `--hold` puts the color in the battery daemon's own loop, where the two are ordered rather than concurrent: when a poll and a re-apply fall due together (2 s after a wake: the follow-up color and the first at-rest battery poll), the poll runs first — it reads its reply back and must find it intact — and the color last, two writes nobody reads back. **Do not run `--watch` alongside `razerd.service --hold`.**
 
 **If the color is lost every time you touch the mouse** (and comes back a couple of seconds later), check the onboard profile's lighting power-saving in Razer Synapse. With the option that dims the lighting when the mouse is idle enabled on a profile (dim to 25 % here), the firmware restores that profile's own lighting over razerd's color on every motion, even after a short pause. Disable it and save the profile. The setting is per profile — `razerd --info` shows the active one — and it is not visible through the commands razerd uses, so razerd cannot detect it.
-
-Run it as a background service to keep your color persistent — see [Installation](#3-optional-systemd-user-service).
 
 ### Battery in the desktop's power applet: `--upower`
 
@@ -123,10 +124,11 @@ Behavior:
 - The **level** is refreshed once a minute. **Charging flips** are caught much faster, without polling fast all day: the charging state only changes when the mouse is put on or lifted off the dock, and either one moves it — so `--upower` watches the dock's input stream (sampling it twice a second, never following it report by report) and queries the battery 1 s after the mouse starts moving, then 2 s and 8 s after it comes to rest. Docking or lifting shows up within a few seconds.
 - The battery only exists while the mouse answers. It appears with a **first real reading** — never a made-up level.
 - A mouse that stops answering is asleep, switched off, out of range or unpaired — razerd cannot tell which: all it sees is a query left unanswered. After an unanswered poll `--upower` retries every 3 s, and once the silence has held for **10 seconds** the battery is **withdrawn** rather than left showing a stale level — the way a Bluetooth peripheral's battery vanishes on disconnect. One lost poll never makes it flicker. Switching the mouse off moves it, which triggers a poll: the entry is gone ~10 s later. A mouse that falls asleep is noticed by the next minute refresh. The battery comes back about a second after the mouse is moved again (or within ~10 s if it becomes reachable without moving); a silent mouse costs one short query every 10 s (the dock gives up in about 10 ms when the mouse is switched off).
-- When the **dock** is unplugged the process exits and the battery disappears at once; the service brings it back within ~30 s of the dock returning (plus the first reading).
+- When the **dock** is unplugged the process exits and the battery disappears at once; udev starts the service again the moment the dock returns (plus the first reading).
+- On `systemctl stop` (SIGTERM) or Ctrl-C the daemon withdraws the battery itself before exiting, so UPower sees a clean removal rather than a device vanishing with its process.
 - The virtual device carries an inert pointer collection (no event is ever emitted on it): the kernel drops HID devices without any input capability, and UPower labels a HID battery after its sibling input device — this is what makes it a "mouse". The side effect is a second, silent *Razer Basilisk V3 Pro 35K* input device on the system (it shows in `/proc/bus/input/devices`).
 
-`--upower` needs a handle on `/dev/uhid`, which is root-only — and should stay so. Run it through the hardened system service rather than by hand: see [Battery bridge](#4-optional-battery-in-the-desktops-power-applet).
+`--upower` needs a handle on `/dev/uhid`, which is root-only — and should stay so. Run it through the hardened system service rather than by hand: see [Deploying](#deploying).
 
 ### Diagnostics: `--sniff`
 
@@ -158,7 +160,7 @@ Installs `razerd` to `/usr/local/bin`, root-owned. `make install` never invokes 
 
 Remove with `sudo make uninstall`.
 
-Why system-wide: `razerd-battery.service` is a system service holding a `/dev/uhid` descriptor. If it ran a binary from your home directory, any process of yours could replace that binary and inherit the descriptor.
+Why system-wide: `razerd.service` is a system service holding a `/dev/uhid` descriptor. If it ran a binary from your home directory, any process of yours could replace that binary and inherit the descriptor.
 
 **Upgrading from a `~/.local` install (≤ 0.9.3):** the user units used to point at `~/.local/bin`. After `sudo make install`, re-run `make install-watch` to refresh it, then drop the old copy: `rm ~/.local/bin/razerd`.
 
@@ -169,7 +171,7 @@ sudo make install-udev
 sudo usermod -aG razerd $USER
 ```
 
-`make install-udev` installs [`contrib/70-razerd.rules`](contrib/70-razerd.rules) to `/etc/udev/rules.d/`, creates the `razerd` system group, and reloads udev. The rule gives that group read/write access to the dock (`1532:00a4`) and its hidraw nodes. Remove with `sudo make uninstall-udev`.
+`make install-udev` installs [`contrib/70-razerd.rules`](contrib/70-razerd.rules) to `/etc/udev/rules.d/`, creates the `razerd` system group, and reloads udev. The rule gives that group read/write access to the dock (`1532:00a4`) and its hidraw nodes, and hands the dock's control interface to systemd as `/dev/razer-dock` so that [`razerd.service`](#deploying) starts with it. Remove with `sudo make uninstall-udev`. (`sudo make install-daemon` below installs the rule too.)
 
 If you installed the rule by hand as `99-razerd.rules` from an older README, delete that copy: `sudo rm /etc/udev/rules.d/99-razerd.rules`.
 
@@ -187,53 +189,62 @@ razerd --check
 sudo groupdel razerd && sudo groupadd -r razerd && sudo usermod -aG razerd $USER
 ```
 
-The reboot is not optional: udevd resolves `GROUP="razerd"` to a numeric GID when it loads the rules, your session and a lingering user manager (`user@<uid>.service`) keep the old GID in their supplementary groups, and `udevadm trigger` alone just re-applies the cached GID. Only a reboot brings udevd, the device nodes and `razerd-watch.service` back in agreement.
+The reboot is not optional: udevd resolves `GROUP="razerd"` to a numeric GID when it loads the rules, your session and a lingering user manager (`user@<uid>.service`) keep the old GID in their supplementary groups, and `udevadm trigger` alone just re-applies the cached GID. Only a reboot brings udevd, the device nodes and the services back in agreement.
 
 Why a group rather than `TAG+="uaccess"`: the ACL granted by `uaccess` only exists while you have an active seat session, so a lingering `razerd-watch.service` started at boot would have no access to the dock until you log in.
 
 On distributions whose initramfs is built with dracut in `hostonly` mode (Fedora), the rule file is copied into the initrd verbatim, where the `razerd` group does not exist. The initrd's udevd then logs two `Failed to resolve group 'razerd', ignoring` lines very early in the boot. They are harmless — the dock is not needed before the root filesystem is mounted.
 
-### 3. (Optional) systemd user service
+## Deploying
 
-Keeping the color in sync after the wireless mouse sleeps or drops off the dock's RF link needs a background job:
+One daemon owns the dock: `razerd.service`, a **system** unit running `razerd --upower $RAZERD_ARGS`, started by udev when the dock is plugged in. It bridges the battery to UPower and, with `--hold <color>` in its configuration file, holds the color.
+
+```bash
+sudo make install-daemon
+```
+
+What it does, in order: loads the SELinux module when SELinux is enabled, retires a ≤ 0.12 `razerd-battery.service` if one is installed, installs `/etc/razerd/razerd.conf` if there is none (the example holds blue), installs the unit, then installs the udev rule and triggers it — which starts the service if the dock is plugged in. Logs: `journalctl -u razerd.service`. Remove with `sudo make uninstall-daemon`.
+
+**The configuration file**, `/etc/razerd/razerd.conf` ([`contrib/razerd.conf`](contrib/razerd.conf)), is a systemd `EnvironmentFile=`: one line, `RAZERD_ARGS=--hold blue`. Change the color there, or drop the line for the battery bridge alone, then `sudo systemctl restart razerd.service`.
+
+**Activation by udev, not by a target.** The udev rule tags the dock's control interface (USB interface 0, the one node razerd talks to) for systemd, names it `/dev/razer-dock`, and has its device unit pull `razerd.service` in; the unit is bound to that device (`BindsTo=` + `After=`). So:
+
+- plug the dock in → the service starts; at boot it starts during device coldplug if the dock is there;
+- unplug it → the daemon exits (the hidraw is gone), and the stop that `BindsTo=` issues cancels the restart `Restart=on-failure` would otherwise schedule. Nothing loops while the dock is absent; the restart is only for transient failures (10 s);
+- there is no `WantedBy=` and nothing to `systemctl enable`: with the dock unplugged, `systemctl status razerd` shows it inactive, and a manual `systemctl start` waits for the device until systemd's device timeout, then fails. `razerd --check` by hand says why: *Razer Mouse Dock Pro not detected*.
+
+**Migrating from ≤ 0.12** (two units, `razerd-battery.service` as system and `razerd-watch.service` as user, which stepped on each other's dock exchanges):
+
+```bash
+systemctl --user disable --now razerd-watch.service   # as yourself: the user unit goes
+make uninstall-watch                                   # (same thing, plus the file)
+sudo make install-daemon                               # retires razerd-battery.service, installs razerd.service
+sudo systemctl status razerd.service                   # active, "Bridging … holding 'blue'"
+```
+
+Change the held color in `/etc/razerd/razerd.conf` if it was not blue. `sudo make uninstall-battery` is kept for removing the old unit alone.
+
+**Permissions — what the unit does and does not grant.** Whoever can open `/dev/uhid` can create arbitrary input devices: inject keystrokes, or feed crafted descriptors to the kernel's HID parsers. So razerd grants that to nobody:
+
+- `/dev/uhid` stays `root:root 0600`. No udev rule, no group — your account and the `razerd` group gain nothing.
+- The service manager opens the node itself and passes the descriptor to the service (`OpenFile=/dev/uhid:uhid`; razerd takes it by that name). Closing it — the process exiting for any reason — makes the kernel remove the virtual device. On SELinux systems (Fedora) the stock policy does not let systemd do that, so `make install-daemon` also loads a one-rule policy module, `contrib/razerd-uhid.cil`: `init_t` — PID 1's own domain, nothing else — may `open read write` `uhid_device_t` (what one `O_RDWR` open is checked against). It is not what keeps your account out of uhid (that is the node's `0600`, untouched), and a root process in `init_t` could already reach uhid by exec'ing into an unconfined domain — so the rule removes no effective barrier.
+- The process runs as a throwaway unprivileged user (`DynamicUser=yes`) with no capabilities, no network, no sockets (not even D-Bus), a read-only filesystem, and a closed device allow-list: the dock's hidraw (through the `razerd` group of step 2), plus `/dev/uhid` itself — required for systemd to open it on the service's behalf, and useless to the process, which has neither the ownership nor a capability to get past `0600`. Check the result with `systemd-analyze security razerd.service`.
+- System calls are an allow-list (`@default @basic-io @io-event @file-system @signal` + `ioctl`) rather than the usual broad `@system-service` — `@signal` covers the SIGTERM/SIGINT handlers — and the unit is capped at 4 tasks and 32 MB.
+- In the code, the report descriptor and the device identity are compile-time constants, and the only values ever written to the virtual device are a percentage and a charging bit — no string from the dock, and no code path that emits a key, a button or motion. Its only inputs are fixed-size replies from the dock and fixed-size events from the kernel.
+
+### The alternative: a user service for `--watch`
+
+For a system without `/dev/uhid`, or if you want the color held by a unit of your own without the battery bridge:
 
 ```bash
 make install-watch
 ```
 
-Installs and enables `razerd-watch.service`, a single long-running process (`razerd --watch blue`) that re-applies the color **the moment the mouse wakes** and stays idle otherwise — no fixed-interval churn. See [Holding a color: `--watch`](#holding-a-color---watch).
+Installs and enables `razerd-watch.service`, a user unit running `razerd --watch blue`. **Not alongside `razerd.service` with `--hold`**: one process must own the dock (see [why](#holding-a-color---hold-and---watch)). It is the alternative, not the recommended deployment.
 
 The unit is sandboxed: no capabilities, no sockets, a read-only filesystem, a system-call allow-list (`systemd-analyze --user security razerd-watch.service`). A user unit gets that from unprivileged user namespaces; the `razerd` group survives them, so the dock stays reachable. If your system forbids user namespaces the start fails with `status=226/NAMESPACE` — drop the `Protect*`/`Private*` lines with `systemctl --user edit razerd-watch.service`.
 
-**Change the color**:
-
-```bash
-systemctl --user edit razerd-watch.service   # change --watch <color>
-```
-
-Remove with `make uninstall-watch`.
-
-To also run at **boot** before you log in:
-
-```bash
-sudo loginctl enable-linger $USER
-```
-
-### 4. (Optional) Battery in the desktop's power applet
-
-```bash
-sudo make install-battery
-```
-
-Installs and enables `razerd-battery.service`, a **system** service running `razerd --upower` — see [Battery in the desktop's power applet](#battery-in-the-desktops-power-applet---upower). It starts at boot, no lingering needed. Logs: `journalctl -u razerd-battery.service`. Remove with `sudo make uninstall-battery`.
-
-**Permissions — what this does and does not grant.** Whoever can open `/dev/uhid` can create arbitrary input devices: inject keystrokes, or feed crafted descriptors to the kernel's HID parsers. So razerd grants that to nobody:
-
-- `/dev/uhid` stays `root:root 0600`. No udev rule, no group — your account and the `razerd` group gain nothing.
-- The service manager opens the node itself and passes the descriptor to the service (`OpenFile=/dev/uhid:uhid`; razerd takes it by that name). Closing it — the process exiting for any reason — makes the kernel remove the virtual device. On SELinux systems (Fedora) the stock policy does not let systemd do that, so `make install-battery` also loads a one-rule policy module, `contrib/razerd-uhid.cil`: `init_t` — PID 1's own domain, nothing else — may `open read write` `uhid_device_t` (what one `O_RDWR` open is checked against). It is not what keeps your account out of uhid (that is the node's `0600`, untouched), and a root process in `init_t` could already reach uhid by exec'ing into an unconfined domain — so the rule removes no effective barrier.
-- The process runs as a throwaway unprivileged user (`DynamicUser=yes`) with no capabilities, no network, no sockets (not even D-Bus), a read-only filesystem, and a closed device allow-list: the dock's hidraw (through the `razerd` group of step 2), plus `/dev/uhid` itself — required for systemd to open it on the service's behalf, and useless to the process, which has neither the ownership nor a capability to get past `0600`. Check the result with `systemd-analyze security razerd-battery.service`.
-- System calls are an allow-list (`@default @basic-io @io-event @file-system @signal` + `ioctl`) rather than the usual broad `@system-service`, and the unit is capped at 4 tasks and 32 MB.
-- In the code, the report descriptor and the device identity are compile-time constants, and the only values ever written to the virtual device are a percentage and a charging bit — no string from the dock, and no code path that emits a key, a button or motion. Its only inputs are fixed-size replies from the dock and fixed-size events from the kernel.
+Change the color with `systemctl --user edit razerd-watch.service`; remove with `make uninstall-watch`; to also run at **boot** before you log in, `sudo loginctl enable-linger $USER`.
 
 ## How it works
 
@@ -268,25 +279,27 @@ The protocol was reverse-engineered from USB captures of Razer Synapse on Window
 | `src/protocol.rs` | The Razer report layer: 90-byte format, command constants, typed queries/writes (battery, serial, firmware, DPI, stages, profiles) |
 | `src/uhid.rs` | The razerd side of the virtual HID battery behind `--upower`: device identity, where the `/dev/uhid` handle comes from, and reading the exposed battery back for `--info`. The uhid mechanism itself is the [`uhid-battery`](https://github.com/GregDuhamel/uhid-battery) crate |
 | `src/cli.rs` | The clap surface: flags, parsers, flag-to-action mapping |
-| `src/actions.rs` | One `run_*` function per flag: the `--watch` loop, the `--upower` loop, the `--info` report, the sensitivity writes |
-| `contrib/70-razerd.rules` | udev rule giving the `razerd` system group access to the dock and its hidraw nodes (installed by `sudo make install-udev`) |
-| `contrib/razerd-watch.service` | systemd user unit running `razerd --watch` (installed by `make install-watch`) |
-| `contrib/razerd-battery.service` | Hardened systemd **system** unit running `razerd --upower` (installed by `sudo make install-battery`) |
-| `contrib/razerd-uhid.cil` | One-rule SELinux module letting systemd open `/dev/uhid` for that unit (loaded by `install-battery` when SELinux is enabled) |
+| `src/actions.rs` | One `run_*` function per flag, and the daemon loop behind `--upower`/`--hold` and `--watch`: one `Schedule` merging the color's re-applies (`HoldSchedule`) and the battery's polls (`PollSchedule`), the `Bridge` state of the virtual battery, the signal flag |
+| `contrib/70-razerd.rules` | udev rule giving the `razerd` system group access to the dock, and handing its control interface to systemd as `/dev/razer-dock` to start `razerd.service` (installed by `sudo make install-udev` or `install-daemon`) |
+| `contrib/razerd.service` | Hardened systemd **system** unit running `razerd --upower $RAZERD_ARGS`, bound to the dock's device unit (installed by `sudo make install-daemon`) |
+| `contrib/razerd.conf` | Example `/etc/razerd/razerd.conf`: `RAZERD_ARGS=--hold blue` |
+| `contrib/razerd-watch.service` | systemd user unit running `razerd --watch` — the standalone alternative (installed by `make install-watch`) |
+| `contrib/razerd-uhid.cil` | One-rule SELinux module letting systemd open `/dev/uhid` for the daemon (loaded by `install-daemon` when SELinux is enabled) |
 
-Unit tests live next to what they test (`mod tests` per module) and need no hardware: the hidraw layer is exercised on a socket pair, device-gone detection on errors shaped like the kernel's. One hardware-gated smoke test is excluded from CI — run it with the dock connected and the mouse awake: `cargo test -- --ignored`.
+Unit tests live next to what they test (`mod tests` per module) and need no hardware: the hidraw layer is exercised on a socket pair, device-gone detection on errors shaped like the kernel's, and the daemon's calendar — pure bookkeeping over `Instant`s — is driven through a wake (color at T+0, battery at T+1 s, follow-up color and at-rest poll together at T+2 s, in that order), the two minute cadences, the retries and the withdrawal. One hardware-gated smoke test is excluded from CI — run it with the dock connected and the mouse awake: `cargo test -- --ignored`.
 
 ```bash
 make build                # cargo build --release
 make check                # what CI runs: fmt, check, clippy, test, doc
 sudo make install         # copy to /usr/local/bin (never builds)
 sudo make install-udev    # install contrib/70-razerd.rules and create the razerd group
-make install-watch        # enable the --watch systemd user service
-sudo make install-battery # enable the --upower systemd system service
+sudo make install-daemon  # razerd.service (--upower, --hold from /etc/razerd/razerd.conf), udev-activated
+make install-watch        # the alternative: a --watch user service, without the bridge
 sudo make uninstall
 sudo make uninstall-udev
+sudo make uninstall-daemon
 make uninstall-watch
-sudo make uninstall-battery
+sudo make uninstall-battery   # ≤ 0.12: remove the old razerd-battery.service alone
 make clean                # cargo clean
 ```
 
@@ -302,8 +315,9 @@ Releases are cut via the **Release** GitHub Action (`workflow_dispatch`) — pic
 - [`anyhow`](https://github.com/dtolnay/anyhow) — error handling
 - [`hidraw`](https://github.com/GregDuhamel/hidraw) — the hidraw transport: sysfs discovery, feature-report ioctls, poll with timeout, device-gone detection (git dependency, pinned to a release tag)
 - [`uhid-battery`](https://github.com/GregDuhamel/uhid-battery) — the virtual HID battery behind `--upower` (git dependency, pinned to a release tag)
+- [`signal-hook`](https://github.com/vorner/signal-hook) (the `flag` module alone, no default features) — SIGTERM/SIGINT raise a flag the daemon loop reads, so it withdraws the battery before exiting
 
-No `libc`: the system calls go through the two crates above, built on `rustix`, and razerd builds with `unsafe_code = "deny"`. The one `unsafe` block, explicitly allowed in `src/uhid.rs`, is the call that takes the `/dev/uhid` descriptor systemd passed and removes the `LISTEN_*` variables from the environment — sound only because razerd is single-threaded at that point.
+razerd calls no `libc` itself: the system calls go through the crates above (`rustix` under the first two), and it builds with `unsafe_code = "deny"`. The one `unsafe` block, explicitly allowed in `src/uhid.rs`, is the call that takes the `/dev/uhid` descriptor systemd passed and removes the `LISTEN_*` variables from the environment — sound only because razerd is single-threaded at that point.
 
 ## License
 

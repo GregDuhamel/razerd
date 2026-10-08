@@ -8,8 +8,9 @@
 //! Layout: [`hid`] is the dock's side of the hidraw transport (which node is
 //! the dock, the send/poll exchange) over the shared `hidraw` crate,
 //! [`protocol`] the Razer report format and typed queries, [`cli`] the flag
-//! surface, and [`actions`] the verb behind each flag. [`uhid`] is the one
-//! piece that does not talk to the dock: the virtual HID device `--upower`
+//! surface, and [`actions`] the verb behind each flag — among them the daemon
+//! loop of `--upower`, the one process meant to own the dock. [`uhid`] is the
+//! one piece that does not talk to the dock: the virtual HID device `--upower`
 //! uses to hand the mouse battery to the kernel, over the shared
 //! `uhid-battery` crate.
 
@@ -20,14 +21,16 @@ mod protocol;
 mod uhid;
 
 use anyhow::Result;
-use clap::Parser;
 
 use cli::{Action, Cli};
 use hid::HidrawDevice;
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse_checked(std::env::args_os()).unwrap_or_else(|err| err.exit());
     let action = cli.action();
+    // An absent dock is an error here, for every action: the daemon does not
+    // wait for it either — udev starts razerd.service when the dock appears
+    // (contrib/70-razerd.rules), and `systemctl status` shows this message.
     let dock = HidrawDevice::open_dock()?;
 
     match action {
@@ -37,7 +40,7 @@ fn main() -> Result<()> {
         Action::Info => actions::run_info(&dock),
         Action::Sniff => actions::run_sniff(&dock),
         Action::Watch(c) => actions::run_watch(&dock, c),
-        Action::Upower => actions::run_upower(&dock),
+        Action::Upower { hold } => actions::run_upower(&dock, hold),
         Action::Sensitivity(d) => actions::run_sensitivity(&dock, d),
         Action::SensitivityStages(on) => actions::run_sensitivity_stages(&dock, on),
     }

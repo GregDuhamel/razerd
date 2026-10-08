@@ -1,9 +1,19 @@
-# Razer Mouse Dock Pro (1532:00a4): let members of the razerd system group
-# open its hidraw nodes, so `razerd` and razerd-watch.service need no root.
-# Installed by `sudo make install-udev`, which also creates the group.
+# Razer Mouse Dock Pro (1532:00a4). Installed by `sudo make install-udev` (and
+# `sudo make install-daemon`), which also creates the razerd group.
 #
-# A group rather than TAG+="uaccess": the ACL uaccess grants only exists
-# while you have an active seat session, and a lingering razerd-watch.service
-# started at boot would have no access until you log in.
+# 1. Let members of the razerd system group open its hidraw nodes, so `razerd`
+#    and razerd-watch.service need no root. A group rather than TAG+="uaccess":
+#    the ACL uaccess grants only exists while you have an active seat session,
+#    and a lingering razerd-watch.service started at boot would have no access
+#    until you log in.
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1532", ATTR{idProduct}=="00a4", GROUP="razerd", MODE="0660"
 KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00a4", GROUP="razerd", MODE="0660"
+#
+# 2. Hand the control interface — USB interface 0, the one node razerd talks
+#    to — to systemd as a device unit, and have it pull razerd.service in. The
+#    symlink gives the unit a stable name, dev-razer\x2ddock.device, for the
+#    BindsTo= in the service: it starts when the dock is plugged in or found at
+#    boot, and stops when the dock goes. ID_USB_INTERFACE_NUM is set by the
+#    usb_id import of 60-persistent-hidraw.rules, which sorts before this file;
+#    the two ATTRS keys sit on the same parent (the USB device), as udev wants.
+KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00a4", ENV{ID_USB_INTERFACE_NUM}=="00", SYMLINK+="razer-dock", TAG+="systemd", ENV{SYSTEMD_WANTS}+="razerd.service"
