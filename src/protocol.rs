@@ -333,7 +333,7 @@ pub(crate) fn query_dpi(dock: &HidrawDevice) -> Result<(u16, u16)> {
 
 /// X and Y as big-endian u16 pairs, after the store byte — the mirror of
 /// `set_dpi_query`.
-fn parse_dpi(resp: &[u8; REPORT_LEN]) -> (u16, u16) {
+const fn parse_dpi(resp: &[u8; REPORT_LEN]) -> (u16, u16) {
     (
         u16::from_be_bytes([resp[9], resp[10]]),
         u16::from_be_bytes([resp[11], resp[12]]),

@@ -165,14 +165,13 @@ Why system-wide: `razerd-battery.service` is a system service holding a `/dev/uh
 ### 2. udev rules (grant non-root access to the dock)
 
 ```bash
-sudo tee /etc/udev/rules.d/99-razerd.rules << 'EOF'
-SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1532", ATTR{idProduct}=="00a4", GROUP="razerd", MODE="0660"
-KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00a4", GROUP="razerd", MODE="0660"
-EOF
-sudo groupadd -rf razerd
+sudo make install-udev
 sudo usermod -aG razerd $USER
-sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
+
+`make install-udev` installs [`contrib/70-razerd.rules`](contrib/70-razerd.rules) to `/etc/udev/rules.d/`, creates the `razerd` system group, and reloads udev. The rule gives that group read/write access to the dock (`1532:00a4`) and its hidraw nodes. Remove with `sudo make uninstall-udev`.
+
+If you installed the rule by hand as `99-razerd.rules` from an older README, delete that copy: `sudo rm /etc/udev/rules.d/99-razerd.rules`.
 
 Log out and back in, then verify:
 

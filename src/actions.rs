@@ -76,7 +76,7 @@ const BATTERY_WITHDRAW_AFTER: Duration = Duration::from_secs(10);
 pub(crate) fn run_check(dock: &HidrawDevice) -> Result<()> {
     println!(
         "✓ Razer Mouse Dock Pro ({}) accessible",
-        dock.path.display()
+        dock.path().display()
     );
     match query_battery(dock) {
         Ok(_) => println!("✓ Razer Basilisk V3 Pro 35K (via Dock) responding over RF"),
@@ -110,7 +110,7 @@ pub(crate) fn run_color(dock: &HidrawDevice, color: ColorName) -> Result<()> {
 /// wake it) and watch whether reports appear at the sleep/wake moments. Runs
 /// until interrupted with Ctrl-C.
 pub(crate) fn run_sniff(dock: &HidrawDevice) -> Result<()> {
-    println!("Sniffing input reports from {}.", dock.path.display());
+    println!("Sniffing input reports from {}.", dock.path().display());
     println!("Exercise the mouse: let it sleep, then move it to wake it.");
     println!("Press Ctrl-C to stop.\n");
 
@@ -207,7 +207,7 @@ pub(crate) fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
     apply_color(dock, color).context("initial color apply failed")?;
     println!(
         "Watching {} — holding '{}', re-applying on wake. Ctrl-C to stop.",
-        dock.path.display(),
+        dock.path().display(),
         color.as_str()
     );
 
@@ -217,14 +217,15 @@ pub(crate) fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
     loop {
         let due = schedule.take_due(Instant::now());
         if due.follow_up {
-            apply_color(dock, color).context("follow-up re-apply failed")?;
-            println!("re-applied '{}' (follow-up)", color.as_str());
+            reapply_color(dock, color, "follow-up")?;
         }
         if due.safety {
-            apply_color(dock, color).context("safety re-apply failed")?;
-            println!("re-applied '{}' (safety refresh)", color.as_str());
+            reapply_color(dock, color, "safety refresh")?;
         }
 
+        // Unlike the re-applies, the input stream is not retried: a
+        // `poll`/`read` only fails with the handle (device gone — EIO on read,
+        // see `is_device_gone`), never because the firmware is busy.
         if !dock.wait_for_input(schedule.next_deadline())? {
             continue; // a follow-up or the safety tick is due
         }
@@ -235,12 +236,26 @@ pub(crate) fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
             continue;
         }
         if let Some(idle_gap) = schedule.on_input(Instant::now()) {
-            apply_color(dock, color).context("wake re-apply failed")?;
-            println!(
-                "re-applied '{}' (mouse woke after {:.0}s idle)",
-                color.as_str(),
-                idle_gap.as_secs_f64()
-            );
+            let reason = format!("mouse woke after {:.0}s idle", idle_gap.as_secs_f64());
+            reapply_color(dock, color, &reason)?;
+        }
+    }
+}
+
+/// One `--watch` re-apply, `reason` saying which. Only a vanished dock is an
+/// error: a transient transfer failure (EPIPE, ETIMEDOUT while the firmware
+/// is busy) is logged and left to the next re-apply, as `poll_battery` does
+/// for `--upower` — restarting the service over it would gain nothing.
+fn reapply_color(dock: &HidrawDevice, color: ColorName, reason: &str) -> Result<()> {
+    match apply_color(dock, color) {
+        Ok(()) => {
+            println!("re-applied '{}' ({reason})", color.as_str());
+            Ok(())
+        }
+        Err(err) if is_device_gone(&err) => Err(err.context("dock disconnected")),
+        Err(err) => {
+            eprintln!("re-apply ({reason}) failed, will retry: {err:#}");
+            Ok(())
         }
     }
 }
@@ -374,7 +389,7 @@ fn mirror_until_silent(
 
     loop {
         let now = Instant::now();
-        let input = schedule.watches_input(now).then(|| dock.file.as_fd());
+        let input = schedule.watches_input(now).then(|| dock.as_fd());
         if device.serve_until(schedule.next_wakeup(now), input)? {
             dock.drain_input_reports()?;
             schedule.on_motion(Instant::now());
@@ -418,7 +433,7 @@ pub(crate) fn run_upower(dock: &HidrawDevice) -> Result<()> {
     let identity = uhid::identity();
     println!(
         "Bridging the mouse battery from {} to UPower — waiting for a first reading.",
-        dock.path.display()
+        dock.path().display()
     );
 
     loop {
@@ -451,13 +466,13 @@ pub(crate) fn run_battery(dock: &HidrawDevice) -> Result<()> {
 #[allow(clippy::unnecessary_wraps)] // see `run_check`
 pub(crate) fn run_info(dock: &HidrawDevice) -> Result<()> {
     println!("Razer Mouse Dock Pro");
-    println!("  Path:     {}", dock.path.display());
+    println!("  Path:     {}", dock.path().display());
     print_field("Serial", query_serial(dock, TX_ID_DOCK).ok());
     print_field("Firmware", query_firmware(dock, TX_ID_DOCK).ok());
 
     println!();
     println!("Razer Basilisk V3 Pro 35K (via Dock)");
-    println!("  Path:     {}", dock.path.display());
+    println!("  Path:     {}", dock.path().display());
 
     // The serial doubles as a liveness probe: a mouse that is asleep or off
     // answers no RF query. After a first miss, report the remaining fields as
@@ -741,7 +756,7 @@ mod tests {
     fn watch_follow_up_and_safety_can_fall_due_together() {
         let t0 = Instant::now();
         let mut schedule = WatchSchedule::new(t0);
-        let wake = t0 + WATCH_SAFETY_INTERVAL - Duration::from_secs(1);
+        let wake = t0 + WATCH_SAFETY_INTERVAL.saturating_sub(Duration::from_secs(1));
         assert!(schedule.on_input(wake).is_some());
         // The tick (t0 + 60 s) comes before the follow-up (wake + 2 s).
         assert_eq!(schedule.next_deadline(), t0 + WATCH_SAFETY_INTERVAL);

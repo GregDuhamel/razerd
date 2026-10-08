@@ -48,8 +48,13 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
+      # The bump above leaves Cargo.lock's own `razerd` entry behind; sync
+      # only that so the build can be `--locked` like CI's.
+      - name: Sync Cargo.lock with the bumped version
+        run: cargo update --workspace
+
       - name: cargo build --release
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Commit version bump and tag
         run: |

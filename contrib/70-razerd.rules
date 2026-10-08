@@ -1,0 +1,9 @@
+# Razer Mouse Dock Pro (1532:00a4): let members of the razerd system group
+# open its hidraw nodes, so `razerd` and razerd-watch.service need no root.
+# Installed by `sudo make install-udev`, which also creates the group.
+#
+# A group rather than TAG+="uaccess": the ACL uaccess grants only exists
+# while you have an active seat session, and a lingering razerd-watch.service
+# started at boot would have no access until you log in.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1532", ATTR{idProduct}=="00a4", GROUP="razerd", MODE="0660"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00a4", GROUP="razerd", MODE="0660"
