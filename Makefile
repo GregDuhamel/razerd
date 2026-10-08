@@ -1,4 +1,4 @@
-.PHONY: build check install uninstall install-watch uninstall-watch install-battery uninstall-battery clean
+.PHONY: build check install uninstall install-udev uninstall-udev install-watch uninstall-watch install-battery uninstall-battery clean
 
 # System-wide by default: the binary must be root-owned, because
 # razerd-battery.service (a system unit holding a /dev/uhid descriptor) runs
@@ -12,6 +12,8 @@ UNIT_DIR        := $(HOME)/.config/systemd/user
 WATCH_UNIT      := $(UNIT_DIR)/razerd-watch.service
 SYSTEM_UNIT_DIR := /etc/systemd/system
 BATTERY_UNIT    := $(SYSTEM_UNIT_DIR)/razerd-battery.service
+UDEV_RULES_DIR  := /etc/udev/rules.d
+UDEV_RULES      := $(UDEV_RULES_DIR)/70-razerd.rules
 
 # The units in contrib/ hard-code /usr/local/bin; follow PREFIX when it differs.
 install_unit = sed 's|/usr/local/bin|$(BINDIR)|g' $(1) | install -Dm 0644 /dev/stdin $(2)
@@ -40,6 +42,27 @@ install:
 uninstall:
 	rm -f $(BIN)
 	@echo "✓ removed: $(BIN)"
+
+# udev rule granting the razerd group access to the dock: run with sudo. The
+# group is a system group (-r): udevd ≥ 258 deprecates device nodes owned by
+# user groups. Adding yourself to it is left to you — it needs your login name,
+# not root's, and a fresh login to take effect.
+install-udev:
+	$(require_root)
+	groupadd -rf razerd
+	install -Dm 0644 contrib/70-razerd.rules $(UDEV_RULES)
+	udevadm control --reload
+	udevadm trigger
+	@echo "✓ udev rule installed: $(UDEV_RULES)"
+	@echo "  Now: sudo usermod -aG razerd \$$USER   (then log out and back in)"
+	@echo "  Verify with: razerd --check"
+
+uninstall-udev:
+	$(require_root)
+	rm -f $(UDEV_RULES)
+	udevadm control --reload
+	udevadm trigger
+	@echo "✓ udev rule removed (the razerd group is kept; 'groupdel razerd' drops it)"
 
 install-watch:
 	$(require_user)

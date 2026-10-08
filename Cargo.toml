@@ -16,6 +16,15 @@ libc = "0.2"
 uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.2.0" }
 clap = { version = "4", features = ["derive"] }
 
+[lints.rust]
+# `deny` is not possible while hid.rs reaches the hidraw ioctls through
+# `libc::ioctl`; it will be once that moves to rustix.
+unsafe_code = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+
 [profile.release]
 opt-level = 3
 lto = true
