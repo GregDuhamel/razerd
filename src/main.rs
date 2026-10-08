@@ -8,18 +8,19 @@
 //! Layout: [`hid`] is the dock's side of the hidraw transport (which node is
 //! the dock, the send/poll exchange) over the shared `hidraw` crate,
 //! [`protocol`] the Razer report format and typed queries, [`cli`] the flag
-//! surface, and [`actions`] the verb behind each flag — among them the daemon
-//! loop of `--upower`, the one process meant to own the dock. [`uhid`] is the
-//! one piece that does not talk to the dock: the virtual HID device `--upower`
-//! uses to hand the mouse battery to the kernel, over the shared
-//! `uhid-battery` crate.
+//! surface, [`commands`] the one-shot verb behind each flag, and [`daemon`]
+//! the loop of `--upower` and `--watch` — the one process meant to own the
+//! dock — with its calendar. [`uhid`] is the one piece that does not talk to
+//! the dock: the virtual HID device `--upower` uses to hand the mouse battery
+//! to the kernel, over the shared `uhid-battery` crate.
 //!
 //! Two kinds of output: a one-shot command prints its result on stdout
 //! (`println!`, what scripts read), the daemon reports through [`log`] on
 //! stderr — the journal, under systemd — and prints nothing.
 
-mod actions;
 mod cli;
+mod commands;
+mod daemon;
 mod hid;
 mod protocol;
 mod uhid;
@@ -41,16 +42,18 @@ fn main() -> ExitCode {
     // An absent dock is an error here, for every action: the daemon does not
     // wait for it either — udev starts razerd.service when the dock appears
     // (contrib/70-razerd.rules), and `systemctl status` shows this message.
+    // A dock that goes *while* the daemon runs is another matter: the daemon
+    // returns `Ok` and the exit status is 0 (see `daemon::Stop`).
     let result = HidrawDevice::open_dock().and_then(|dock| match action {
-        Action::Check => actions::run_check(&dock),
-        Action::Color(c) => actions::run_color(&dock, c),
-        Action::Battery => actions::run_battery(&dock),
-        Action::Info => actions::run_info(&dock),
-        Action::Sniff => actions::run_sniff(&dock),
-        Action::Watch(c) => actions::run_watch(&dock, c),
-        Action::Upower { hold } => actions::run_upower(&dock, hold),
-        Action::Sensitivity(d) => actions::run_sensitivity(&dock, d),
-        Action::SensitivityStages(on) => actions::run_sensitivity_stages(&dock, on),
+        Action::Check => commands::run_check(&dock),
+        Action::Color(c) => commands::run_color(&dock, c),
+        Action::Battery => commands::run_battery(&dock),
+        Action::Info => commands::run_info(&dock),
+        Action::Sniff => commands::run_sniff(&dock),
+        Action::Watch(c) => daemon::run_watch(&dock, c),
+        Action::Upower { hold } => daemon::run_upower(&dock, hold),
+        Action::Sensitivity(d) => commands::run_sensitivity(&dock, d),
+        Action::SensitivityStages(on) => commands::run_sensitivity_stages(&dock, on),
     });
 
     match result {

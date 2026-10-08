@@ -17,6 +17,16 @@ Type=exec
 # every re-apply.
 Environment=RUST_LOG=info
 ExecStart=/usr/local/bin/razerd --watch blue
+# For a transient failure only. An unplugged dock is not one: the daemon
+# exits 0 and the unit goes inactive, not failed — and is not restarted. A
+# user unit cannot be bound to the dock's device unit the way razerd.service
+# is, so when the dock is back, start it again by hand (`systemctl --user
+# start razerd-watch.service`), or have it come back by itself at the cost of
+# a start attempt — and a "not detected" line — every RestartSec while the
+# dock is absent: `systemctl --user edit razerd-watch.service` with
+#   [Service]
+#   Restart=always
+#   RestartSec=30
 Restart=on-failure
 RestartSec=5
 

@@ -5,6 +5,60 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-10-09
+
+### Fixed
+
+- Unplugging the dock made the daemon exit 1 — `waiting on the dock and the
+  virtual battery: waiting on the devices: the wake descriptor is hung up, in
+  error or not open`, and `systemctl status` showed `razerd.service` failed,
+  though `BindsTo=` was stopping it anyway. The dock going is not a failure
+  of the daemon: it now withdraws the battery, logs `dock unplugged —
+  stopping` (info; the error the hidraw answered is a debug line) and exits
+  0, exactly as on a signal — whether the loop met the gone dock in an
+  exchange (`is_device_gone`: ENODEV, EIO on read) or in its wait. uhid-battery
+  reports a hung-up wake descriptor as a plain error with no type to match
+  on, so after a wait that fails with no battery to blame the daemon asks the
+  dock's node itself (`HidrawDevice::is_hung_up`: one `poll()` with no
+  timeout, `POLLHUP | POLLERR | POLLNVAL` — the flags that wait refuses) and
+  marks the error `HungUp`, which `is_device_gone` recognises. Tested on the
+  read end of a pipe whose writer is gone: the wait, and the whole loop,
+  return cleanly.
+- For `--watch` under `razerd-watch.service` the same exit 0 means the unit
+  goes inactive, not failed, and `Restart=on-failure` leaves it there: when
+  the dock is back, `systemctl --user start razerd-watch.service` (it used to
+  come back by itself, by failing every 5 s while the dock was absent). The
+  unit and the README document the `Restart=always` / `RestartSec=30`
+  override for whoever prefers that.
+
+### Changed
+
+- `src/actions.rs` (1312 lines) is split, without a change of behavior:
+  `src/commands.rs` (the one-shot `run_*`), `src/daemon/mod.rs` (the loop,
+  `Bridge`, the wait, `Stop`) and `src/daemon/schedule.rs` (`Schedule`,
+  `HoldSchedule`, `PollSchedule`, the cadences and their tests). The loop's
+  turn is its own function (`turn`), and `Bridge::after_poll` moves the
+  state in place.
+- `src/protocol.rs`: the eight queries and writes spelled their four header
+  bytes out in a `build_query` call each; they are a `Command` table now
+  (transaction id, class, id, data size: one constant per command, the data
+  size with the command it belongs to) and `Command::exchange`. Not a byte
+  sent changes: a test pins every command's header, and the whole report,
+  against the values they used to spell out.
+- The release binary is a static build for `x86_64-unknown-linux-musl`
+  (razerd links no C library: its system calls go through `rustix`), checked
+  with `file`, and the release carries `SHA256SUMS` next to
+  `razerd-x86_64-linux`; the README says how to verify and install it.
+- `main`'s comment on the absent dock says what a dock that goes while the
+  daemon runs does; the README's `--watch`, `--upower`, *Deploying*, *Logs*,
+  *The alternative*, *Source layout* and *Dependencies* sections follow.
+
+### Added
+
+- Tests: the hung-up node is told from a quiet one and from pending input;
+  `HungUp` anywhere in the chain is a gone device; the wait passes wake-ups
+  and deadlines through on a live dock; every command's header bytes.
+
 ## [0.14.0] - 2026-10-09
 
 The daemon logs; the commands print. `--upower` and `--watch` used to
@@ -228,6 +282,7 @@ Releases before 0.11.0 — 0.1.0 to 0.4.0 (2026-04-18), 0.5.0 to 0.8.0
 (2026-09-19 to 21) — predate this file; their notes are on the
 [GitHub releases page](https://github.com/GregDuhamel/razerd/releases).
 
+[0.15.0]: https://github.com/GregDuhamel/razerd/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/GregDuhamel/razerd/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/GregDuhamel/razerd/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/GregDuhamel/razerd/compare/v0.12.0...v0.13.0

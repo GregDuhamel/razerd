@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use hidraw::{Bus, Device, Filter, Node};
+use hidraw::{Bus, Device, Filter, Node, PollFd, PollFlags};
 
 use crate::protocol::REPORT_LEN;
 
@@ -74,6 +74,14 @@ impl HidrawDevice {
         Ok(Self { device })
     }
 
+    /// A stand-in for the node, for the tests of whoever waits on it.
+    #[cfg(test)]
+    pub(crate) fn from_fd(fd: impl Into<std::os::fd::OwnedFd>) -> Self {
+        Self {
+            device: Device::from_fd(fd, "/dev/hidraw-fake"),
+        }
+    }
+
     /// The `/dev/hidraw*` node this handle was opened on.
     pub(crate) fn path(&self) -> &Path {
         self.device.path()
@@ -127,6 +135,32 @@ impl HidrawDevice {
             .drain()
             .context("draining hidraw input reports")?;
         Ok(())
+    }
+
+    /// Is the node hung up — the dock unplugged while this handle was held?
+    ///
+    /// One `poll()` that returns at once: for a device that no longer exists
+    /// `hidraw_poll` answers `POLLERR | POLLHUP`, which the kernel reports
+    /// whether or not they were asked for, on every call. For the daemon,
+    /// whose wait on this descriptor runs next to the virtual battery's
+    /// (uhid-battery's `serve_all`) and reports such a descriptor as a plain
+    /// error with no type to match on: the verdict is taken here, on the node
+    /// itself. The flags are the ones that wait refuses, so the two agree.
+    ///
+    /// Not a drain: the queued reports, if any, stay for the loop.
+    pub(crate) fn is_hung_up(&self) -> Result<bool> {
+        let mut fds = [PollFd::from_borrowed_fd(self.as_fd(), PollFlags::IN)];
+        loop {
+            match hidraw::poll(&mut fds, Duration::ZERO) {
+                Ok(_) => break,
+                // Possible in theory even with no time to wait.
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err).context("polling the dock's hidraw node"),
+            }
+        }
+        Ok(fds[0]
+            .revents()
+            .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL))
     }
 
     /// Send a request and poll for the matching 90-byte response, returning it
@@ -208,19 +242,36 @@ fn is_fresh_reply(
     saw_pending || response != leftover
 }
 
-/// Did this exchange fail because the hidraw node itself is gone (dock
-/// unplugged)? Long-running actions must exit on that — the handle will never
-/// work again — whereas a timeout, a firmware error status or a transient
-/// transfer error (EPIPE, ETIMEDOUT) only means the mouse is asleep, out of
-/// range, or the firmware busy.
+/// The dock's node found hung up by [`HidrawDevice::is_hung_up`], as the
+/// context of the error that made the daemon look. An error carrying it is a
+/// gone device for [`is_device_gone`], like hidraw's own verdict.
+#[derive(Debug)]
+pub(crate) struct HungUp;
+
+impl std::fmt::Display for HungUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the dock's hidraw node is hung up")
+    }
+}
+
+impl std::error::Error for HungUp {}
+
+/// Did this operation fail because the hidraw node itself is gone (dock
+/// unplugged)? The daemon stops on that — the handle will never work again,
+/// and it is no failure of its own — whereas a timeout, a firmware error
+/// status or a transient transfer error (EPIPE, ETIMEDOUT) only means the
+/// mouse is asleep, out of range, or the firmware busy.
 ///
 /// The verdict is [`hidraw::is_gone`]'s — ENODEV from an ioctl, or the EIO
 /// that `read()` answers for an unplugged device and hidraw marks as such —
-/// applied to every `io::Error` in the chain.
+/// applied to every `io::Error` in the chain; or a [`HungUp`] in it, the
+/// daemon's own finding when its wait failed on the node.
 pub(crate) fn is_device_gone(err: &anyhow::Error) -> bool {
-    err.chain()
-        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .any(hidraw::is_gone)
+    err.downcast_ref::<HungUp>().is_some()
+        || err
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .any(hidraw::is_gone)
 }
 
 /// Outcome of inspecting a response's status byte (`response[0]`).
@@ -296,9 +347,7 @@ mod tests {
         // `read(2)` with that very errno. What matters is that it comes out
         // of `Device::read`, the path hidraw marks.
         let mem = std::fs::File::open("/proc/self/mem").unwrap();
-        let dock = HidrawDevice {
-            device: Device::from_fd(mem, "/dev/hidraw-fake"),
-        };
+        let dock = HidrawDevice::from_fd(mem);
         let gone_on_read = dock
             .read_input_report(&mut [0u8; 8])
             .expect_err("read(2) at an unmapped address must fail")
@@ -318,14 +367,49 @@ mod tests {
         assert!(!is_device_gone(&eio_on_ioctl));
     }
 
+    /// The daemon's own verdict after a failed wait is a gone device too,
+    /// wherever it sits in the chain — and the wait's error stays readable.
+    #[test]
+    fn device_gone_is_a_hung_up_node_in_the_chain() {
+        let hung_up = anyhow::Error::from(io::Error::other(
+            "waiting on the devices: the wake descriptor is hung up, in error or not open",
+        ))
+        .context(HungUp)
+        .context("waiting on the dock and the virtual battery");
+        assert!(is_device_gone(&hung_up));
+        assert!(format!("{hung_up:#}").contains("is hung up"), "{hung_up:#}");
+
+        // The same wait failure, with the node found alive, stays an error.
+        let plain = anyhow::Error::from(io::Error::other("poll refused"))
+            .context("waiting on the dock and the virtual battery");
+        assert!(!is_device_gone(&plain));
+    }
+
+    /// `poll()` reports a hung-up node on every call, readable or not: the
+    /// read end of a pipe whose writer is gone stands in for the unplugged
+    /// dock (`hidraw_poll` answers `POLLERR | POLLHUP` for it).
+    #[test]
+    fn a_hung_up_node_is_told_from_a_quiet_one() {
+        let (dock, peer) = fake();
+        assert!(!dock.is_hung_up().unwrap());
+        // Input pending is not a hang-up either.
+        peer.send(&[0; 8]).unwrap();
+        assert!(!dock.is_hung_up().unwrap());
+
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        let dock = HidrawDevice::from_fd(reader);
+        assert!(!dock.is_hung_up().unwrap());
+        drop(writer);
+        assert!(dock.is_hung_up().unwrap());
+        // Nothing was read: the verdict is `poll()`'s alone, and it holds.
+        assert!(dock.is_hung_up().unwrap());
+    }
+
     /// A datagram socket pair stands in for the node: like hidraw, it
     /// delivers one message per `read(2)`.
     fn fake() -> (HidrawDevice, UnixDatagram) {
         let (node, peer) = UnixDatagram::pair().unwrap();
-        let dock = HidrawDevice {
-            device: Device::from_fd(node, "/dev/hidraw-fake"),
-        };
-        (dock, peer)
+        (HidrawDevice::from_fd(node), peer)
     }
 
     /// The daemon waits on the handle through `AsFd` (uhid-battery's

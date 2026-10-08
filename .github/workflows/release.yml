@@ -42,8 +42,14 @@ jobs:
       - name: Update Cargo.toml version
         run: sed -i 's/^version = .*/version = "${{ steps.version.outputs.version }}"/' Cargo.toml
 
+      # A static binary: razerd links no C library (its system calls go
+      # through rustix; the `libc` crate under signal-hook is bindings), so
+      # the musl target makes one that runs on any x86_64 Linux, whatever its
+      # glibc. The target's standard library is the only thing to add.
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
@@ -53,8 +59,16 @@ jobs:
       - name: Sync Cargo.lock with the bumped version
         run: cargo update --workspace
 
-      - name: cargo build --release
-        run: cargo build --locked --release
+      - name: cargo build --release (static, musl)
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+
+      # Not a binary that happens to work on the runner: the kernel is the
+      # only thing it may need. Rust makes the musl binary a static PIE,
+      # which `file` reports as "static-pie linked" (older versions:
+      # "statically linked"); a "dynamically linked" one fails the release.
+      - name: Check the binary is statically linked
+        run: |
+          file target/x86_64-unknown-linux-musl/release/razerd | tee /dev/stderr | grep -Eq 'static(ally|-pie) linked'
 
       - name: Commit version bump and tag
         run: |
@@ -68,12 +82,19 @@ jobs:
           git tag "v${{ steps.version.outputs.version }}"
           git push origin "v${{ steps.version.outputs.version }}"
 
-      - name: Rename binary
-        run: cp target/release/razerd razerd-x86_64-linux
+      # The asset keeps its name (installs in the field script it), and
+      # SHA256SUMS lets `sha256sum -c` check the download (see the README).
+      - name: Name the binary and write the checksums
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/razerd razerd-x86_64-linux
+          sha256sum razerd-x86_64-linux > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.version }}
-          files: razerd-x86_64-linux
+          files: |
+            razerd-x86_64-linux
+            SHA256SUMS
           generate_release_notes: true
