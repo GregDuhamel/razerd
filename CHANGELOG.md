@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] - 2026-10-09
+
+### Fixed
+
+- `razerd.service` failed to start with `217/USER`: with `DynamicUser=yes` the
+  dynamic user takes the unit's name, and `razerd` is already the system group
+  of the udev rule. The unit now sets `User=razerd-daemon`.
+
 ## [0.13.0] - 2026-10-09
 
 One daemon owns the dock. `razerd-battery.service` (system, `--upower`) and
@@ -174,6 +182,7 @@ Releases before 0.11.0 — 0.1.0 to 0.4.0 (2026-04-18), 0.5.0 to 0.8.0
 (2026-09-19 to 21) — predate this file; their notes are on the
 [GitHub releases page](https://github.com/GregDuhamel/razerd/releases).
 
+[0.13.1]: https://github.com/GregDuhamel/razerd/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/GregDuhamel/razerd/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/GregDuhamel/razerd/compare/v0.11.2...v0.12.0
 [0.11.2]: https://github.com/GregDuhamel/razerd/compare/v0.11.1...v0.11.2
