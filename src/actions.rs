@@ -12,7 +12,7 @@ use crate::protocol::{
     dock_rgb_report, format_dpi, mouse_via_dock_rgb_report, query_battery, query_dpi,
     query_dpi_stages, query_firmware, query_profiles, query_serial, set_dpi, set_dpi_stages,
 };
-use crate::uhid::{self, Battery, Kind};
+use crate::uhid::{self, Battery, CreateErrorKind, Kind, Wakeup};
 
 // `--watch` re-applies the color when the mouse wakes. The dock emits no
 // dedicated wake event — it just resumes forwarding mouse-motion input reports
@@ -390,13 +390,19 @@ fn mirror_until_silent(
     loop {
         let now = Instant::now();
         let input = schedule.watches_input(now).then(|| dock.as_fd());
-        if device.serve_until(schedule.next_wakeup(now), input)? {
-            dock.drain_input_reports()?;
-            schedule.on_motion(Instant::now());
-            continue;
+        match device.serve_until(schedule.next_wakeup(now), input)? {
+            Wakeup::Wake => {
+                dock.drain_input_reports()?;
+                schedule.on_motion(Instant::now());
+                continue;
+            }
+            // razerd installs no signal handler, so there is no flag to look
+            // at: just wait again.
+            Wakeup::Interrupted => continue,
+            Wakeup::Deadline => {}
         }
         if Instant::now() < schedule.next_poll_at() {
-            continue; // woke to look at the input stream again, or on a signal
+            continue; // woke to look at the input stream again
         }
 
         let status = poll_battery(dock)?;
@@ -405,7 +411,7 @@ fn mirror_until_silent(
         if let Some(status) = status {
             // Pushed even when unchanged: each push past the kernel's 30 s
             // rate-limit re-announces the battery to UPower.
-            device.update(status.percent, status.charging)?;
+            device.update(status.into())?;
             silent_since = None;
             if status != last {
                 println!("battery: {status}");
@@ -438,14 +444,17 @@ pub(crate) fn run_upower(dock: &HidrawDevice) -> Result<()> {
 
     loop {
         let first = wait_for_first_reading(dock)?;
-        let mut device = Battery::create(
-            handle,
-            &identity,
-            Kind::Mouse,
-            first.percent,
-            first.charging,
-        )
-        .context("cannot create the virtual battery device")?;
+        let mut device =
+            Battery::create(handle, &identity, Kind::Mouse, first.into()).map_err(|err| {
+                // The identity is a constant (`uhid::identity`), so the kernel
+                // refusing it is a bug in razerd — no retry would help.
+                let context = if err.kind() == CreateErrorKind::InvalidIdentity {
+                    "the virtual battery identity is invalid — this is a bug in razerd"
+                } else {
+                    "cannot create the virtual battery device"
+                };
+                anyhow::Error::new(err).context(context)
+            })?;
         println!("battery: {first}");
 
         mirror_until_silent(dock, &mut device, first)?;

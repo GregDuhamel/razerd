@@ -10,16 +10,18 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use uhid_battery::{DEV_UHID, Handle, Identity};
+use uhid_battery::{DEV_UHID, Handle, Identity, Reading};
 
-pub(crate) use uhid_battery::{Battery, Kind};
+use crate::protocol::BatteryStatus;
+
+pub(crate) use uhid_battery::{Battery, CreateErrorKind, Kind, Wakeup};
 
 // Name of the descriptor in the unit: `OpenFile=/dev/uhid:uhid`.
 const INHERITED_FD_NAME: &str = "uhid";
 
-const RAZER_VENDOR_ID: u32 = 0x1532;
+const RAZER_VENDOR_ID: u16 = 0x1532;
 // The Basilisk V3 Pro 35K's own (wired) product id.
-const BASILISK_V3_PRO_35K_PRODUCT_ID: u32 = 0x00CC;
+const BASILISK_V3_PRO_35K_PRODUCT_ID: u16 = 0x00CC;
 
 // Names the power supply (`hid-razerd-battery*`). A constant rather than the
 // mouse serial: no string that came from the dock is ever handed to the kernel.
@@ -28,12 +30,18 @@ const DEVICE_UNIQ: &str = "razerd";
 /// How the virtual device presents itself. All constants: the only values that
 /// ever reach the kernel from the dock are a percentage and a charging bit.
 pub(crate) fn identity() -> Identity {
-    Identity {
-        name: "Razer Basilisk V3 Pro 35K".into(),
-        phys: "razerd".into(),
-        uniq: DEVICE_UNIQ.into(),
-        vendor: RAZER_VENDOR_ID,
-        product: BASILISK_V3_PRO_35K_PRODUCT_ID,
+    Identity::new("Razer Basilisk V3 Pro 35K", DEVICE_UNIQ)
+        .phys("razerd")
+        .vendor(RAZER_VENDOR_ID)
+        .product(BASILISK_V3_PRO_35K_PRODUCT_ID)
+}
+
+/// What the dock reported, as the kernel is told it. `BatteryStatus` stays
+/// razerd's own type: it is what `--battery` prints (`89% (charging)`), a
+/// format scripts rely on, and the crate's `Reading` has no `Display`.
+impl From<BatteryStatus> for Reading {
+    fn from(status: BatteryStatus) -> Self {
+        Self::new(status.percent, status.charging)
     }
 }
 
@@ -103,6 +111,16 @@ mod tests {
         assert_eq!(id.name, "Razer Basilisk V3 Pro 35K");
         assert_eq!(id.uniq, "razerd");
         assert_eq!((id.vendor, id.product), (0x1532, 0x00CC));
+    }
+
+    /// A reading reaches the kernel exactly as the dock reported it.
+    #[test]
+    fn a_dock_reading_converts_as_is() {
+        let status = BatteryStatus {
+            percent: 31,
+            charging: true,
+        };
+        assert_eq!(Reading::from(status), Reading::new(31, true));
     }
 
     /// `[report id 2, strength, charging]` is what kernels in the field have
