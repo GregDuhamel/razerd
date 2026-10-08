@@ -33,7 +33,12 @@ RestartSec=10
 # unprivileged user whose only other device is the dock's hidraw (via the
 # razerd group from the udev rule).
 OpenFile=/dev/uhid:uhid
+# The dynamic user is named after the unit unless User= says otherwise, and
+# "razerd" is already the system group of the udev rule: systemd refuses to
+# allocate a user whose name a static group holds ("User or group with
+# specified name already exists", exit 217/USER). So the user has its own name.
 DynamicUser=yes
+User=razerd-daemon
 SupplementaryGroups=razerd
 DevicePolicy=closed
 DeviceAllow=char-hidraw rw
