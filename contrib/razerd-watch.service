@@ -1,6 +1,10 @@
 [Unit]
 Description=Razer RGB color hold (re-applies on wireless mouse wake)
-Documentation=https://github.com/GregDuhamel/razerd#holding-a-color---watch
+Documentation=https://github.com/GregDuhamel/razerd#holding-a-color---hold-and---watch
+# The standalone alternative, for a system without /dev/uhid or for a user
+# unit alone. The recommended deployment is razerd.service with `--hold` in
+# /etc/razerd/razerd.conf: one process owning the dock. Never run both — two
+# writers to the dock's single report buffer corrupt each other's exchanges.
 
 [Service]
 # Long-running: blocks on the dock's input stream and re-applies the color

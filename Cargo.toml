@@ -1,6 +1,6 @@
 [package]
 name = "razerd"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -17,6 +17,10 @@ clap = { version = "4", features = ["derive"] }
 # feature-report ioctls, poll with timeout, and telling an unplugged dock from
 # a transfer that merely failed. Not on crates.io; pinned to a release tag.
 hidraw = { git = "https://github.com/GregDuhamel/hidraw", tag = "v0.1.0" }
+# SIGTERM/SIGINT raise a flag for the daemon loop, which then withdraws the
+# virtual battery before exiting. Only the flag module: no iterator, no
+# channel, no thread.
+signal-hook = { version = "0.4", default-features = false }
 uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.4.0" }
 
 [dev-dependencies]
@@ -25,8 +29,9 @@ uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.
 rustix = { version = "1.1.5", default-features = false, features = ["std"] }
 
 [lints.rust]
-# The system calls go through hidraw and uhid-battery, which wrap them safely;
-# the one `unsafe` left (`uhid::open`) is a documented environment edit.
+# The system calls go through hidraw, uhid-battery and signal-hook, which wrap
+# them safely; the one `unsafe` left (`uhid::open`) is a documented environment
+# edit.
 unsafe_code = "deny"
 
 [lints.clippy]

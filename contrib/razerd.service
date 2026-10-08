@@ -1,14 +1,31 @@
 [Unit]
-Description=Razer mouse battery bridge to UPower (virtual HID battery)
-Documentation=https://github.com/GregDuhamel/razerd#battery-in-the-desktops-power-applet---upower
+Description=Razer Mouse Dock Pro daemon (mouse battery to UPower, held color)
+Documentation=https://github.com/GregDuhamel/razerd#deploying
+# Started by udev, not by a target: contrib/70-razerd.rules hands the dock's
+# control interface to systemd as a device unit (named after the symlink it
+# adds, /dev/razer-dock — "\x2d" is the escaped dash, see systemd-escape) and
+# has it pull this service in. So the service starts when the dock is plugged
+# in, or found at boot, and BindsTo= stops it when the dock goes. No WantedBy=
+# on purpose: with the dock unplugged at boot a WantedBy=multi-user.target would
+# hold the target up for the device timeout, whereas here nothing waits.
+BindsTo=dev-razer\x2ddock.device
+After=dev-razer\x2ddock.device
 
 [Service]
 # Type=exec: a missing binary fails the start instead of a "started" unit.
 Type=exec
-ExecStart=/usr/local/bin/razerd --upower
-# Exits when the dock is unplugged; come back once it is plugged in again.
+# Extra arguments come from /etc/razerd/razerd.conf (see contrib/razerd.conf):
+# `--hold <color>` makes the daemon also hold a color, what razerd-watch.service
+# did in a second process — do not run both.
+EnvironmentFile=-/etc/razerd/razerd.conf
+ExecStart=/usr/local/bin/razerd --upower $RAZERD_ARGS
+# For a transient failure only (the kernel refusing the virtual device while an
+# earlier one is still being torn down, say). An unplugged dock is not one: the
+# daemon exits, BindsTo= stops the unit — which cancels a pending restart — and
+# udev starts it again when the dock is back. So this no longer loops every
+# RestartSec while the dock is absent, as it did when the target started it.
 Restart=on-failure
-RestartSec=30
+RestartSec=10
 
 # /dev/uhid lets its holder create arbitrary input devices, so nobody is
 # granted access to it: the node stays root:root 0600, the service manager
@@ -55,11 +72,10 @@ UMask=0077
 SystemCallArchitectures=native
 # Allow-list, not the usual @system-service: everything the process does is
 # read/write/poll/ioctl on two descriptors plus sysfs discovery of the dock.
+# @signal covers the SIGTERM/SIGINT handlers (rt_sigaction) that let it
+# withdraw the battery before exiting; ppoll is in @io-event.
 SystemCallFilter=@default @basic-io @io-event @file-system @signal ioctl
 
 # One thread and a few MB (peak measured: 5 MB) — anything beyond is a bug.
 TasksMax=4
 MemoryMax=32M
-
-[Install]
-WantedBy=multi-user.target

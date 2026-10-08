@@ -10,12 +10,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use uhid_battery::{DEV_UHID, Handle, Identity, Reading};
+use uhid_battery::{DEV_UHID, Identity, Reading};
 
 use crate::hid::RAZER_VENDOR_ID;
 use crate::protocol::BatteryStatus;
 
-pub(crate) use uhid_battery::{Battery, CreateErrorKind, Kind, Wakeup};
+pub(crate) use uhid_battery::{Battery, CreateErrorKind, Handle, Kind, Wakeup, serve_all};
 
 // Name of the descriptor in the unit: `OpenFile=/dev/uhid:uhid`.
 const INHERITED_FD_NAME: &str = "uhid";
@@ -64,9 +64,8 @@ pub(crate) fn open() -> Result<Handle> {
     if let Some(handle) = inherited.into_iter().next() {
         return Ok(handle);
     }
-    Handle::open(DEV_UHID).with_context(|| {
-        format!("cannot open {DEV_UHID} — run via razerd-battery.service (or as root)")
-    })
+    Handle::open(DEV_UHID)
+        .with_context(|| format!("cannot open {DEV_UHID} — run via razerd.service (or as root)"))
 }
 
 /// The battery the kernel registered for our virtual device, read back from

@@ -119,18 +119,6 @@ impl HidrawDevice {
         self.device.read(buf).context("reading hidraw input report")
     }
 
-    /// Wait until an input report is queued or `deadline` passes; `true` means
-    /// input is pending. Long-running actions use it as a "the mouse is being
-    /// moved" signal without consuming the stream report by report.
-    pub(crate) fn wait_for_input(&self, deadline: Instant) -> Result<bool> {
-        // One `poll(POLLIN)`, taken up again with the time left when a signal
-        // cuts it short — hidraw's business.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        self.device
-            .wait_readable(remaining)
-            .with_context(|| format!("poll on {} failed", self.path().display()))
-    }
-
     /// Discard every queued input report without blocking. The kernel keeps at
     /// most [`hidraw::INPUT_QUEUE_LEN`] (64) per open handle, and one pass is
     /// bounded by that, so this is bounded even while the mouse moves.
@@ -340,21 +328,19 @@ mod tests {
         (dock, peer)
     }
 
+    /// The daemon waits on the handle through `AsFd` (uhid-battery's
+    /// `serve_all` polls it next to the virtual battery); what is read or
+    /// drained afterwards is the wrapper's.
     #[test]
-    fn input_is_waited_for_then_read_or_drained() {
+    fn input_is_read_or_drained() {
         let (dock, peer) = fake();
         assert_eq!(dock.path(), Path::new("/dev/hidraw-fake"));
-
-        // Nothing queued: a deadline already passed answers at once, a short
-        // one waits it out.
-        assert!(!dock.wait_for_input(Instant::now()).unwrap());
-        let deadline = Instant::now() + Duration::from_millis(5);
-        assert!(!dock.wait_for_input(deadline).unwrap());
-        assert!(Instant::now() >= deadline);
+        let pending = |dock: &HidrawDevice| dock.device.wait_readable(Duration::ZERO).unwrap();
+        assert!(!pending(&dock));
 
         let mut buf = [0u8; 8];
         peer.send(&[0, 0, 0, 0, 3, 0, 2, 0]).unwrap();
-        assert!(dock.wait_for_input(Instant::now()).unwrap());
+        assert!(pending(&dock));
         assert_eq!(dock.read_input_report(&mut buf).unwrap(), 8);
         assert_eq!(buf, [0, 0, 0, 0, 3, 0, 2, 0]);
 
@@ -363,7 +349,7 @@ mod tests {
             peer.send(&[0; 8]).unwrap();
         }
         dock.drain_input_reports().unwrap();
-        assert!(!dock.wait_for_input(Instant::now()).unwrap());
+        assert!(!pending(&dock));
     }
 
     /// One drain pass was bounded by the kernel's per-handle queue (64) so a

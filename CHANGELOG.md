@@ -5,6 +5,82 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-10-09
+
+One daemon owns the dock. `razerd-battery.service` (system, `--upower`) and
+`razerd-watch.service` (user, `--watch`) each opened the dock's hidraw, and the
+firmware has one report buffer and no transaction ids: a color written during
+a battery query left the query reading a foreign header (a poll counted
+unanswered), and a query in flight had the color command refused (`EPIPE`) —
+both triggered by the same mouse movement (color at T+0 and T+2 s, battery at
+T+1, T+2 and T+8 s). `razerd.service` now runs `--upower --hold <color>`: one
+process, one calendar, the two exchanges ordered rather than concurrent.
+
+### Added
+
+- `--hold <COLOR>`, an option of `--upower`: the daemon also holds the color,
+  re-applying it on wake (with the 2 s follow-up) and on the 60 s safety
+  cadence, exactly as `--watch` does, from the same loop as the battery polls.
+  `--hold` without `--upower` is refused (clap's `requires` would have let
+  `--watch red --hold blue` through, so the rule is checked after parsing).
+- `contrib/razerd.service`, replacing `razerd-battery.service`:
+  `ExecStart=razerd --upower $RAZERD_ARGS` with
+  `EnvironmentFile=-/etc/razerd/razerd.conf`; `contrib/razerd.conf` is the
+  example (`RAZERD_ARGS=--hold blue`). Same hardening as before.
+- Activation by udev: `contrib/70-razerd.rules` tags the dock's control
+  interface (USB interface 0) for systemd, names it `/dev/razer-dock` and has
+  its device unit want `razerd.service`; the unit is `BindsTo=`/`After=` that
+  device. The service starts when the dock is plugged in (or found at boot)
+  and stops when it goes; nothing loops while the dock is absent, and
+  `Restart=on-failure` (10 s) is left for transient failures. No `WantedBy=`.
+- Clean stop: SIGTERM and SIGINT raise a flag (`signal-hook`, flag module
+  only); the loop leaves its wait on `Wakeup::Interrupted`, destroys the
+  virtual battery — a clean removal for UPower — and logs that it withdrew it.
+- `make install-daemon` / `uninstall-daemon`: SELinux module, migration from
+  `razerd-battery.service` (disabled, removed), `/etc/razerd/razerd.conf`
+  installed if absent, unit, udev rule, trigger, and a start or restart when
+  the dock is present. `make install-battery` is an alias; `uninstall-battery`
+  removes the old unit alone.
+- README: a *Deploying* section (the daemon, the configuration file, the
+  udev activation, the migration from the two units, the user unit as the
+  alternative), `--hold` in the options table, the tests of the merged
+  calendar in *Development*.
+- Tests of the merged calendar: a wake colors at T+0, polls at T+1 s, and at
+  T+2 s takes the follow-up color and the at-rest poll in one turn (poll
+  first); the safety tick and the refresh on their own clocks, and together
+  when they coincide; each half alone; the absent-cadence retry.
+
+### Changed
+
+- The `--upower` and `--watch` loops are one, `run_daemon`: a `Schedule`
+  holding a `HoldSchedule` (the color: wake, follow-up, safety tick) and a
+  `PollSchedule` (the battery: refresh, motion polls, retries), each optional;
+  the next wake-up is the earliest of the two, and a turn takes what both owe —
+  the battery poll before the color, since the poll reads the firmware's reply
+  back while the color is two writes nobody reads back. The virtual battery's
+  states (absent, exposed, silent) are a `Bridge` enum. `--watch` is the same
+  loop without a bridge. Constants and their cadences are unchanged.
+- The input stream is sampled (one look, a drain, half a second muted) in
+  `--watch` too, as `--upower` already did; wake detection is unchanged (a
+  sleeping mouse's stream is watched continuously).
+- A first battery reading is asked for at once at start; after a withdrawal
+  the next poll comes on the absent cadence (10 s) or a second after the
+  mouse moves, rather than immediately after the one that withdrew it.
+- When a follow-up and a safety tick fall due together, one re-apply is sent
+  and logged with both reasons, instead of two.
+- `razerd-watch.service` stays as the standalone alternative; its unit and
+  the README say not to run it alongside `razerd.service` with `--hold`.
+- `uhid::open`'s error names `razerd.service`; the SELinux module's comment
+  too.
+- `HidrawDevice::wait_for_input` is gone: the daemon waits on the handle
+  through `AsFd` in uhid-battery's `serve_all`, which a signal cuts short
+  (hidraw's `wait_readable` takes the wait up again after one).
+
+### Removed
+
+- `contrib/razerd-battery.service` (renamed to `razerd.service`, see above)
+  and its `WantedBy=multi-user.target`.
+
 ## [0.12.0] - 2026-10-08
 
 The transport moved to the shared [hidraw](https://github.com/GregDuhamel/hidraw)
@@ -98,6 +174,7 @@ Releases before 0.11.0 — 0.1.0 to 0.4.0 (2026-04-18), 0.5.0 to 0.8.0
 (2026-09-19 to 21) — predate this file; their notes are on the
 [GitHub releases page](https://github.com/GregDuhamel/razerd/releases).
 
+[0.13.0]: https://github.com/GregDuhamel/razerd/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/GregDuhamel/razerd/compare/v0.11.2...v0.12.0
 [0.11.2]: https://github.com/GregDuhamel/razerd/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/GregDuhamel/razerd/compare/v0.11.0...v0.11.1

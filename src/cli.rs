@@ -1,6 +1,9 @@
 //! Command-line surface: one mutually-exclusive action per invocation.
 
-use clap::{Parser, ValueEnum};
+use std::ffi::OsString;
+
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, ValueEnum};
 
 use crate::protocol::{DPI_MAX, DPI_MIN, Rgb};
 
@@ -33,14 +36,21 @@ pub(crate) struct Cli {
     #[arg(long, group = "action")]
     sniff: bool,
 
-    /// Hold a color, re-applying it whenever the mouse wakes (runs until stopped).
+    /// Hold a color, re-applying it whenever the mouse wakes, without the
+    /// UPower bridge (runs until stopped; the daemon is --upower --hold).
     #[arg(long, value_enum, value_name = "COLOR", group = "action")]
     watch: Option<ColorName>,
 
-    /// Expose the mouse battery to UPower (KDE/GNOME power applets) through a
-    /// virtual HID device (runs until stopped; see razerd-battery.service).
+    /// Run the daemon: expose the mouse battery to UPower (KDE/GNOME power
+    /// applets) through a virtual HID device, and hold a color with --hold
+    /// (runs until stopped; see razerd.service).
     #[arg(long, group = "action")]
     upower: bool,
+
+    /// With --upower: also hold this color, re-applying it whenever the mouse
+    /// wakes — what --watch does, in the same process as the battery bridge.
+    #[arg(long, value_enum, value_name = "COLOR")]
+    hold: Option<ColorName>,
 
     /// Set the sensitivity to one fixed DPI value (the free slider): collapses
     /// the onboard stage table to it, so the Cycle Up Sensitivity Stages
@@ -62,12 +72,32 @@ pub(crate) enum Action {
     Info,
     Sniff,
     Watch(ColorName),
-    Upower,
+    Upower { hold: Option<ColorName> },
     Sensitivity(u16),
     SensitivityStages(bool),
 }
 
 impl Cli {
+    /// Parse `args`, with the one rule the groups cannot express: `--hold`
+    /// goes with `--upower`. A `requires = "upower"` on the flag would let
+    /// `--watch red --hold blue` through — clap excuses a missing required
+    /// flag when it conflicts with a flag that is present — so it is checked
+    /// here, as a clap error like the others.
+    pub(crate) fn try_parse_checked<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let cli = Self::try_parse_from(args)?;
+        if cli.hold.is_some() && !cli.upower {
+            return Err(Self::command().error(
+                ErrorKind::MissingRequiredArgument,
+                "'--hold <COLOR>' goes with '--upower'",
+            ));
+        }
+        Ok(cli)
+    }
+
     pub(crate) fn action(&self) -> Action {
         [
             self.check.then_some(Action::Check),
@@ -76,7 +106,7 @@ impl Cli {
             self.info.then_some(Action::Info),
             self.sniff.then_some(Action::Sniff),
             self.watch.map(Action::Watch),
-            self.upower.then_some(Action::Upower),
+            self.upower.then_some(Action::Upower { hold: self.hold }),
             self.sensitivity.map(Action::Sensitivity),
             self.sensitivity_stages.map(Action::SensitivityStages),
         ]
@@ -173,15 +203,38 @@ mod tests {
         );
     }
 
+    /// `--hold` is an option of the daemon, not an action of its own: alone
+    /// there is nothing to hold the color in, and `--watch` already holds one.
+    #[test]
+    fn hold_goes_with_upower_only() {
+        let parse = |args: &[&str]| Cli::try_parse_checked(args);
+        assert!(parse(&["razerd", "--hold", "blue"]).is_err());
+        assert!(parse(&["razerd", "--watch", "red", "--hold", "blue"]).is_err());
+        assert!(parse(&["razerd", "--check", "--hold", "blue"]).is_err());
+        assert!(parse(&["razerd", "--upower", "--hold", "blue"]).is_ok());
+        assert!(parse(&["razerd", "--upower"]).is_ok());
+        // The other rules still come from clap.
+        assert!(parse(&["razerd", "--upower", "--watch", "red"]).is_err());
+    }
+
     #[test]
     fn cli_maps_flags_to_actions() {
-        let action = |args: &[&str]| Cli::try_parse_from(args).unwrap().action();
+        let action = |args: &[&str]| Cli::try_parse_checked(args).unwrap().action();
         assert!(matches!(action(&["razerd", "--check"]), Action::Check));
         assert!(matches!(
             action(&["razerd", "--color", "blue"]),
             Action::Color(ColorName::Blue)
         ));
-        assert!(matches!(action(&["razerd", "--upower"]), Action::Upower));
+        assert!(matches!(
+            action(&["razerd", "--upower"]),
+            Action::Upower { hold: None }
+        ));
+        assert!(matches!(
+            action(&["razerd", "--upower", "--hold", "blue"]),
+            Action::Upower {
+                hold: Some(ColorName::Blue)
+            }
+        ));
         assert!(matches!(
             action(&["razerd", "--sensitivity", "1800"]),
             Action::Sensitivity(1800)
