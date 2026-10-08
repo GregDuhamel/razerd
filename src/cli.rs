@@ -11,7 +11,18 @@ use crate::protocol::{DPI_MAX, DPI_MIN, Rgb};
 // these" (required + non-multiple) so the struct needs no pairwise conflict
 // lists and `action()` needs no arity checks.
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about,
+    after_help = "A command prints its result on stdout. The daemon (--upower, --watch) \
+                  reports on stderr through the log: info for its transitions (start, \
+                  battery exposed or withdrawn, stop), warn for a transient error it \
+                  retries; -v adds every battery poll and color re-apply (debug), -vv the \
+                  trace level. RUST_LOG=debug (or RUST_LOG=razerd=trace) does the same, \
+                  -v taking precedence over it. Under systemd the lines carry journald \
+                  priorities, so `journalctl -p warning -u razerd` shows the warnings alone."
+)]
 #[command(group = clap::ArgGroup::new("action").required(true).multiple(false))]
 #[allow(clippy::struct_excessive_bools)] // one bool per valueless flag — clap's model
 pub(crate) struct Cli {
@@ -63,6 +74,11 @@ pub(crate) struct Cli {
     /// DPI and disable the button.
     #[arg(long, value_parser = clap::builder::BoolishValueParser::new(), value_name = "on|off", group = "action")]
     sensitivity_stages: Option<bool>,
+
+    /// Log more: -v for debug (every battery poll and color re-apply), -vv
+    /// for trace. Not an action: it goes with --upower or --watch.
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
 }
 
 pub(crate) enum Action {
@@ -75,6 +91,14 @@ pub(crate) enum Action {
     Upower { hold: Option<ColorName> },
     Sensitivity(u16),
     SensitivityStages(bool),
+}
+
+impl Action {
+    /// Runs until stopped, and reports through the log rather than stdout:
+    /// its fatal error goes to the journal too.
+    pub(crate) const fn is_daemon(&self) -> bool {
+        matches!(self, Self::Watch(_) | Self::Upower { .. })
+    }
 }
 
 impl Cli {
@@ -114,6 +138,11 @@ impl Cli {
         .flatten()
         .next()
         .expect("clap's `action` group guarantees exactly one flag is set")
+    }
+
+    /// How many `-v` were given.
+    pub(crate) const fn verbose(&self) -> u8 {
+        self.verbose
     }
 }
 
@@ -253,5 +282,37 @@ mod tests {
             action(&["razerd", "--sensitivity-stages", "OFF"]),
             Action::SensitivityStages(false)
         ));
+    }
+
+    /// `-v` counts, cumulates, and is no action: alone it is still "no
+    /// action given".
+    #[test]
+    fn verbose_counts_and_is_not_an_action() {
+        let verbose = |args: &[&str]| Cli::try_parse_checked(args).unwrap().verbose();
+        assert_eq!(verbose(&["razerd", "--check"]), 0);
+        assert_eq!(verbose(&["razerd", "--upower", "-v"]), 1);
+        assert_eq!(verbose(&["razerd", "-vv", "--watch", "blue"]), 2);
+        assert_eq!(verbose(&["razerd", "--upower", "-v", "-v"]), 2);
+        assert_eq!(verbose(&["razerd", "--upower", "--verbose", "-vv"]), 3);
+        assert!(Cli::try_parse_checked(["razerd", "-vv"]).is_err());
+    }
+
+    /// The two long-running actions log; every other prints.
+    #[test]
+    fn only_the_long_running_actions_are_daemons() {
+        let action = |args: &[&str]| Cli::try_parse_checked(args).unwrap().action();
+        assert!(action(&["razerd", "--upower"]).is_daemon());
+        assert!(action(&["razerd", "--upower", "--hold", "red"]).is_daemon());
+        assert!(action(&["razerd", "--watch", "blue"]).is_daemon());
+        for args in [
+            ["razerd", "--check"],
+            ["razerd", "--battery"],
+            ["razerd", "--info"],
+            ["razerd", "--sniff"],
+        ] {
+            assert!(!action(&args).is_daemon(), "{args:?}");
+        }
+        assert!(!action(&["razerd", "--color", "off"]).is_daemon());
+        assert!(!action(&["razerd", "--dpi", "1800"]).is_daemon());
     }
 }

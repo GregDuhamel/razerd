@@ -18,6 +18,12 @@ Type=exec
 # `--hold <color>` makes the daemon also hold a color, what razerd-watch.service
 # did in a second process — do not run both.
 EnvironmentFile=-/etc/razerd/razerd.conf
+# The daemon logs to the journal with journald priorities, so
+# `journalctl -p warning -u razerd` shows the warnings alone. info is the
+# default (the transitions: start, battery exposed or withdrawn, stop); for
+# every poll and re-apply set RUST_LOG=debug here, or add `-v` to the
+# arguments in /etc/razerd/razerd.conf (RAZERD_ARGS=--hold blue -v).
+Environment=RUST_LOG=info
 ExecStart=/usr/local/bin/razerd --upower $RAZERD_ARGS
 # For a transient failure only (the kernel refusing the virtual device while an
 # earlier one is still being torn down, say). An unplugged dock is not one: the

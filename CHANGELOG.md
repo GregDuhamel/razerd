@@ -5,6 +5,52 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-10-09
+
+The daemon logs; the commands print. `--upower` and `--watch` used to
+`println!` every re-apply and every battery change — several hundred journal
+lines a day, all at the journal's default priority, so nothing could be
+filtered. They now report through `log`, with journald priorities under
+systemd. The one-shot commands (`--check`, `--battery`, `--info`, `--color`,
+`--sniff`, `--sensitivity`…) print their result on stdout exactly as before.
+
+### Added
+
+- `-v` / `--verbose`, cumulative: `-v` logs at debug (every battery poll with
+  its reading or the firmware's reason for a miss, every color re-apply with
+  its reason), `-vv` at trace (each sample of the dock's input stream), for
+  this crate. `RUST_LOG` does the same (`RUST_LOG=debug`,
+  `RUST_LOG=razerd=trace`), `-v` taking precedence. `--help` ends with a note
+  on the two. No `--quiet`: at the default level nothing is logged per poll.
+- Under systemd (`JOURNAL_STREAM` set) each line carries its journald
+  priority (`<3>` error, `<4>` warn, `<6>` info, `<7>` debug and trace) and
+  no timestamp of its own, so `journalctl -p warning -u razerd` filters.
+  On a terminal the lines are timestamped and colored (`env_logger` with the
+  `auto-color` and `humantime` features alone).
+- `Environment=RUST_LOG=info` in `razerd.service` and `razerd-watch.service`,
+  with a comment on `journalctl -p warning` and on `-v` through
+  `/etc/razerd/razerd.conf` (`RAZERD_ARGS=--hold blue -v`); `contrib/razerd.conf`
+  documents `-v`.
+- README: a *Logs* section (the levels, `-v`, `RUST_LOG`, `journalctl -p`,
+  a day at `-v`), `-v` in the options table.
+- Tests: `-v` counts and is no action; which actions are daemons; the
+  journald priority table.
+
+### Changed
+
+- The daemon's messages and their levels: start ("bridging the mouse battery
+  from … to UPower, holding '…'", "watching … — holding '…'"), battery
+  exposed, a charging flip ("battery: 100% (charging)"), battery withdrawn
+  and the stop are `info`; each poll (answered or not), each re-apply and the
+  initial color are `debug`; a re-apply the firmware refused is `warn`
+  (it was `eprintln!`); a level change alone is no longer its own line — the
+  poll's debug line has it.
+- The daemon's fatal error (dock disconnected, no `/dev/uhid`, dock absent at
+  start) is logged at `error` — `journalctl -p err` finds it — instead of the
+  `Error: …` a `main() -> Result` printed. A command's fatal error is printed
+  on stderr as before, same text, same exit status.
+- `main` returns an `ExitCode` and holds the logger; the dispatch is unchanged.
+
 ## [0.13.1] - 2026-10-09
 
 ### Fixed
@@ -182,6 +228,7 @@ Releases before 0.11.0 — 0.1.0 to 0.4.0 (2026-04-18), 0.5.0 to 0.8.0
 (2026-09-19 to 21) — predate this file; their notes are on the
 [GitHub releases page](https://github.com/GregDuhamel/razerd/releases).
 
+[0.14.0]: https://github.com/GregDuhamel/razerd/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/GregDuhamel/razerd/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/GregDuhamel/razerd/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/GregDuhamel/razerd/compare/v0.11.2...v0.12.0

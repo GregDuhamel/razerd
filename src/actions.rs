@@ -1,11 +1,19 @@
 //! The verb behind each CLI flag: one `run_*` function per action.
+//!
+//! A command prints its result on stdout, for the person or script that ran
+//! it. The daemon loop ([`run_daemon`], behind `--upower` and `--watch`)
+//! prints nothing: it logs — info for its transitions, debug for each poll
+//! and re-apply, warn for a transient error it retries — and under systemd
+//! that is the journal.
 
+use std::io::Write as _;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use log::{debug, info, trace, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
 
 use crate::cli::ColorName;
@@ -118,6 +126,10 @@ pub(crate) fn run_sniff(dock: &HidrawDevice) -> Result<()> {
     println!("Exercise the mouse: let it sleep, then move it to wake it.");
     println!("Press Ctrl-C to stop.\n");
 
+    // Written with `writeln!` rather than `println!`: a reader that goes away
+    // (`razerd --sniff | head`) closes the pipe, and `println!` would panic on
+    // the broken pipe where ending quietly is what the user meant.
+    let mut out = std::io::stdout().lock();
     let start = Instant::now();
     let mut buf = [0u8; 256];
     loop {
@@ -127,7 +139,12 @@ pub(crate) fn run_sniff(dock: &HidrawDevice) -> Result<()> {
         }
         let elapsed = start.elapsed().as_secs_f64();
         let hex: Vec<String> = buf[..n].iter().map(|b| format!("{b:02x}")).collect();
-        println!("[{elapsed:8.3}s] {n:3} bytes: {}", hex.join(" "));
+        if let Err(err) = writeln!(out, "[{elapsed:8.3}s] {n:3} bytes: {}", hex.join(" ")) {
+            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(err).context("writing to stdout");
+        }
     }
 }
 
@@ -239,18 +256,18 @@ impl HoldSchedule {
 
 /// One re-apply of the held color, `reason` saying which. Only a vanished
 /// dock is an error: a transient transfer failure (EPIPE, ETIMEDOUT while the
-/// firmware is busy) is logged and left to the next re-apply, as
+/// firmware is busy) is a warning and left to the next re-apply, as
 /// `poll_battery` does for the battery — restarting the service over it would
 /// gain nothing.
 fn reapply_color(dock: &HidrawDevice, color: ColorName, reason: &str) -> Result<()> {
     match apply_color(dock, color) {
         Ok(()) => {
-            println!("re-applied '{}' ({reason})", color.as_str());
+            debug!("re-applied '{}' ({reason})", color.as_str());
             Ok(())
         }
         Err(err) if is_device_gone(&err) => Err(err.context("dock disconnected")),
         Err(err) => {
-            eprintln!("re-apply ({reason}) failed, will retry: {err:#}");
+            warn!("re-apply ({reason}) failed, will retry: {err:#}");
             Ok(())
         }
     }
@@ -258,11 +275,19 @@ fn reapply_color(dock: &HidrawDevice, color: ColorName, reason: &str) -> Result<
 
 /// One battery poll for the daemon loop: `None` when the mouse does not
 /// answer (asleep, out of range), an error only when the dock itself is gone.
+/// Each outcome is a debug line, with the firmware's reason for a miss
+/// (status 0x04 is its "no RF reply").
 fn poll_battery(dock: &HidrawDevice) -> Result<Option<BatteryStatus>> {
     match query_battery(dock) {
-        Ok(status) => Ok(Some(status)),
+        Ok(status) => {
+            debug!("battery poll: {status}");
+            Ok(Some(status))
+        }
         Err(err) if is_device_gone(&err) => Err(err.context("dock disconnected")),
-        Err(_) => Ok(None),
+        Err(err) => {
+            debug!("battery poll unanswered: {err:#}");
+            Ok(None)
+        }
     }
 }
 
@@ -467,7 +492,7 @@ enum Bridge {
     Absent(Handle),
     Exposed {
         battery: Battery,
-        // The last reading, so only changes are logged.
+        // The last reading, so a charging flip is told from a refresh.
         last: BatteryStatus,
         // When the current run of unanswered polls began.
         silent_since: Option<Instant>,
@@ -507,7 +532,7 @@ impl Bridge {
                         };
                         anyhow::Error::new(err).context(context)
                     })?;
-                println!("battery: {first}");
+                info!("battery exposed to UPower: {first}");
                 Ok(Self::Exposed {
                     battery,
                     last: first,
@@ -525,8 +550,10 @@ impl Bridge {
                 battery
                     .update(status.into())
                     .context("updating the virtual battery")?;
-                if status != last {
-                    println!("battery: {status}");
+                // Docked or lifted: a transition. A level that moved is the
+                // poll's own debug line.
+                if status.charging != last.charging {
+                    info!("battery: {status}");
                 }
                 Ok(Self::Exposed {
                     battery,
@@ -545,7 +572,7 @@ impl Bridge {
                 let since = silent_since.unwrap_or(now);
                 if should_withdraw_battery(now.duration_since(since)) {
                     let handle = battery.destroy();
-                    println!(
+                    info!(
                         "battery withdrawn — mouse silent for {} s (asleep, off or out of range)",
                         BATTERY_WITHDRAW_AFTER.as_secs()
                     );
@@ -568,7 +595,7 @@ impl Bridge {
     fn withdraw(self) {
         if let Self::Exposed { battery, .. } = self {
             drop(battery.destroy());
-            println!("battery withdrawn — stopping");
+            info!("battery withdrawn");
         }
     }
 }
@@ -609,6 +636,7 @@ fn run_daemon(dock: &HidrawDevice, hold: Option<ColorName>, mut bridge: Bridge) 
 
     if let Some(color) = hold {
         apply_color(dock, color).context("initial color apply failed")?;
+        debug!("applied '{}' at start", color.as_str());
     }
     let mut schedule = Schedule::new(Instant::now(), hold.is_some(), bridge.is_on());
     dock.drain_input_reports()?;
@@ -630,6 +658,7 @@ fn run_daemon(dock: &HidrawDevice, hold: Option<ColorName>, mut bridge: Bridge) 
         let input = schedule.watches_input(now).then(|| dock.as_fd());
         match wait(&mut bridge, schedule.next_wakeup(now), input)? {
             Wakeup::Wake => {
+                trace!("input from the dock — the mouse moves");
                 dock.drain_input_reports()?;
                 schedule.on_input(Instant::now());
             }
@@ -638,6 +667,7 @@ fn run_daemon(dock: &HidrawDevice, hold: Option<ColorName>, mut bridge: Bridge) 
         }
     }
 
+    info!("stopping on signal");
     bridge.withdraw();
     Ok(())
 }
@@ -649,8 +679,8 @@ fn run_daemon(dock: &HidrawDevice, hold: Option<ColorName>, mut bridge: Bridge) 
 /// otherwise `--upower --hold` does the same from the one daemon. Runs until
 /// the process is signalled (Ctrl-C, or `systemctl stop`).
 pub(crate) fn run_watch(dock: &HidrawDevice, color: ColorName) -> Result<()> {
-    println!(
-        "Watching {} — holding '{}', re-applying on wake. Ctrl-C to stop.",
+    info!(
+        "watching {} — holding '{}', re-applying on wake",
         dock.path().display(),
         color.as_str()
     );
@@ -668,8 +698,8 @@ pub(crate) fn run_upower(dock: &HidrawDevice, hold: Option<ColorName>) -> Result
     let holding = hold.map_or(String::new(), |color| {
         format!(", holding '{}'", color.as_str())
     });
-    println!(
-        "Bridging the mouse battery from {} to UPower{holding} — waiting for a first reading.",
+    info!(
+        "bridging the mouse battery from {} to UPower{holding} — waiting for a first reading",
         dock.path().display()
     );
     run_daemon(dock, hold, Bridge::Absent(handle))
