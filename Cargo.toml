@@ -1,6 +1,6 @@
 [package]
 name = "razerd"
-version = "0.11.2"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -12,14 +12,22 @@ categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
 anyhow = "1"
-libc = "0.2"
-uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.4.0" }
 clap = { version = "4", features = ["derive"] }
+# The hidraw transport: sysfs discovery of the dock's control interface, the
+# feature-report ioctls, poll with timeout, and telling an unplugged dock from
+# a transfer that merely failed. Not on crates.io; pinned to a release tag.
+hidraw = { git = "https://github.com/GregDuhamel/hidraw", tag = "v0.1.0" }
+uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.4.0" }
+
+[dev-dependencies]
+# The errno values (ENODEV, EIO, EPIPE) the device-gone tests build errors
+# from; the same crate hidraw is built on, with the same features.
+rustix = { version = "1.1.5", default-features = false, features = ["std"] }
 
 [lints.rust]
-# `deny` is not possible while hid.rs reaches the hidraw ioctls through
-# `libc::ioctl`; it will be once that moves to rustix.
-unsafe_code = "warn"
+# The system calls go through hidraw and uhid-battery, which wrap them safely;
+# the one `unsafe` left (`uhid::open`) is a documented environment edit.
+unsafe_code = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

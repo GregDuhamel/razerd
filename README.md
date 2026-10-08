@@ -36,7 +36,7 @@ razerd --sniff
 | `--upower` | Expose the mouse battery to UPower, and so to the desktop's power applet, through a virtual HID device (runs until stopped — meant for `razerd-battery.service`) |
 | `--sensitivity <value>` (alias `--dpi`) | Set the sensitivity to one fixed DPI value (100–35000), disabling the Cycle Up Sensitivity Stages button |
 | `--sensitivity-stages on\|off` | `on`: install the 5-stage table (400/800/1600/3200/6400) and enable the Cycle Up Sensitivity Stages button; `off`: freeze the current DPI and disable it |
-| `--check` | Verify devices are detected and accessible |
+| `--check` | Verify the dock is detected and accessible, and that the mouse answers over RF |
 | `--battery` | Report mouse battery percentage and charging status |
 | `--info` | Full device report: serial, firmware, battery, DPI, stages lock state, onboard profile, and the battery exposed by `--upower` |
 | `--sniff` | Diagnostic: dump timestamped HID input reports from the dock (Ctrl-C to stop) |
@@ -237,7 +237,10 @@ Installs and enables `razerd-battery.service`, a **system** service running `raz
 
 ## How it works
 
-razerd communicates with the dock via the Linux `hidraw` interface using `HIDIOCSFEATURE` ioctls — no kernel driver detachment, no libusb.
+razerd talks to the dock through the Linux `hidraw` interface — no kernel driver detachment, no libusb — and hands the mouse battery to the kernel through `uhid`. Both mechanisms live in crates shared with the other daemons of this account; razerd keeps only what is specific to Razer:
+
+- [`hidraw`](https://github.com/GregDuhamel/hidraw) talks to the dock: `hidraw::discover` lists `/sys/class/hidraw` and keeps the node whose HID device is the dock's control interface — vendor `1532`, product `00A4`, on the **USB** bus (the mouse paired over Bluetooth and the virtual battery below bear the same ids) and USB interface 0 (`bInterfaceNumber` in sysfs: the dock is a composite device with one node per interface). `Device::set_feature` / `get_feature` are the `HIDIOCSFEATURE` / `HIDIOCGFEATURE` ioctls, with the report-ID byte (`0`, the dock declares none) in front of each 90-byte report; `wait_readable` / `read` / `drain` watch the dock's input stream for `--watch`, `--upower` and `--sniff`; `is_gone` tells an unplugged dock (`ENODEV` from an ioctl, `EIO` from `read`) from a mouse that merely did not answer. What stays in razerd (`src/hid.rs`) is the exchange: send the request, poll the report buffer every 2 ms for up to 100 ms until the firmware's status byte says the transaction is complete, and check that the reply carries the request's header and is not the previous transaction's reply read back.
+- [`uhid-battery`](https://github.com/GregDuhamel/uhid-battery) publishes what was read: the virtual HID device behind [`--upower`](#battery-in-the-desktops-power-applet---upower). See below.
 
 The Razer Mouse Dock Pro (`1532:00A4`) exposes three HID interfaces on USB. All LED commands go through **interface 0** (`/dev/hidraw0`). The dock firmware routes commands to the appropriate target based on the `data_size` field in the 90-byte Razer HID report:
 
@@ -246,7 +249,7 @@ The Razer Mouse Dock Pro (`1532:00A4`) exposes three HID interfaces on USB. All 
 | `0x1D` (29) | `0x07` | 8 | Dock LED ring |
 | `0x2C` (44) | `0x0C` | 13 | Basilisk V3 Pro 35K via RF |
 
-Battery queries use command class `0x07` (power): `cmd=0x80` for level, `cmd=0x84` for charging status. Onboard profile queries use class `0x05`: `cmd=0x80` for the slot count, `cmd=0x84` for the active slot. DPI uses class `0x04`: `cmd=0x85` reads and `cmd=0x05` writes X/Y as big-endian u16 pairs behind a storage-slot byte (`0x00` = live/RAM — what the sensor runs at and what the Cycle Up Sensitivity Stages button updates; `0x01` = persistent). The Cycle Up Sensitivity Stages button's stage table is `cmd=0x86`/`0x06`: active stage, stage count, then up to 5 × (index, X, Y, 2 reserved); `--sensitivity` writes it with a single stage. The dock forwards the request over RF and the mouse's reply is read back with `HIDIOCGFEATURE`.
+Battery queries use command class `0x07` (power): `cmd=0x80` for level, `cmd=0x84` for charging status. Onboard profile queries use class `0x05`: `cmd=0x80` for the slot count, `cmd=0x84` for the active slot. DPI uses class `0x04`: `cmd=0x85` reads and `cmd=0x05` writes X/Y as big-endian u16 pairs behind a storage-slot byte (`0x00` = live/RAM — what the sensor runs at and what the Cycle Up Sensitivity Stages button updates; `0x01` = persistent). The Cycle Up Sensitivity Stages button's stage table is `cmd=0x86`/`0x06`: active stage, stage count, then up to 5 × (index, X, Y, 2 reserved); `--sensitivity` writes it with a single stage. The dock forwards the request over RF and the mouse's reply is read back from the same report buffer (`HIDIOCGFEATURE`), once its status byte says the round-trip is complete (`0x02`; `0x00`/`0x01` still pending, `0x04` no RF reply, `0x03`/`0x05` rejected).
 
 `--upower` is the one feature that does not talk to the dock alone: through the [`uhid-battery`](https://github.com/GregDuhamel/uhid-battery) crate it writes `uhid` events (`UHID_CREATE2`, then one `UHID_INPUT2` per reading: `[report id, strength 0–100, charging bit]`) to a `/dev/uhid` descriptor inherited from systemd, and answers the kernel's `UHID_GET_REPORT` when the level is read before a report landed. The device sits on `BUS_VIRTUAL`, so only `hid-generic` binds to it — never a Razer-specific driver or userspace matcher keyed on `usb:1532:*`.
 
@@ -261,28 +264,33 @@ The protocol was reverse-engineered from USB captures of Razer Synapse on Window
 | File | Role |
 |---|---|
 | `src/main.rs` | Module wiring and the flag → action dispatch — nothing else |
-| `src/hid.rs` | Hidraw transport: device discovery via sysfs, feature-report ioctls, the send/poll exchange with its response-correlation check |
+| `src/hid.rs` | The dock's side of the hidraw transport: which node is the dock (a `hidraw::Filter`), the report-ID byte in front of each report, the send/poll exchange with its status codes and response-correlation check, and which errors mean the dock is gone. The transport itself (sysfs discovery, ioctls, poll) is the [`hidraw`](https://github.com/GregDuhamel/hidraw) crate |
 | `src/protocol.rs` | The Razer report layer: 90-byte format, command constants, typed queries/writes (battery, serial, firmware, DPI, stages, profiles) |
 | `src/uhid.rs` | The razerd side of the virtual HID battery behind `--upower`: device identity, where the `/dev/uhid` handle comes from, and reading the exposed battery back for `--info`. The uhid mechanism itself is the [`uhid-battery`](https://github.com/GregDuhamel/uhid-battery) crate |
 | `src/cli.rs` | The clap surface: flags, parsers, flag-to-action mapping |
 | `src/actions.rs` | One `run_*` function per flag: the `--watch` loop, the `--upower` loop, the `--info` report, the sensitivity writes |
+| `contrib/70-razerd.rules` | udev rule giving the `razerd` system group access to the dock and its hidraw nodes (installed by `sudo make install-udev`) |
 | `contrib/razerd-watch.service` | systemd user unit running `razerd --watch` (installed by `make install-watch`) |
 | `contrib/razerd-battery.service` | Hardened systemd **system** unit running `razerd --upower` (installed by `sudo make install-battery`) |
 | `contrib/razerd-uhid.cil` | One-rule SELinux module letting systemd open `/dev/uhid` for that unit (loaded by `install-battery` when SELinux is enabled) |
 
-Unit tests live next to what they test (`mod tests` per module). One hardware-gated smoke test is excluded from CI — run it with the dock connected: `cargo test -- --ignored`.
+Unit tests live next to what they test (`mod tests` per module) and need no hardware: the hidraw layer is exercised on a socket pair, device-gone detection on errors shaped like the kernel's. One hardware-gated smoke test is excluded from CI — run it with the dock connected and the mouse awake: `cargo test -- --ignored`.
 
 ```bash
 make build                # cargo build --release
 make check                # what CI runs: fmt, check, clippy, test, doc
 sudo make install         # copy to /usr/local/bin (never builds)
+sudo make install-udev    # install contrib/70-razerd.rules and create the razerd group
 make install-watch        # enable the --watch systemd user service
 sudo make install-battery # enable the --upower systemd system service
 sudo make uninstall
+sudo make uninstall-udev
 make uninstall-watch
 sudo make uninstall-battery
 make clean                # cargo clean
 ```
+
+Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 CI runs `cargo fmt --check`, `cargo check`, `cargo clippy -D warnings`, `cargo test`, `cargo doc -D warnings`, and a release build on every push to `main` and every PR targeting it.
 
@@ -292,8 +300,10 @@ Releases are cut via the **Release** GitHub Action (`workflow_dispatch`) — pic
 
 - [`clap`](https://github.com/clap-rs/clap) — CLI argument parsing
 - [`anyhow`](https://github.com/dtolnay/anyhow) — error handling
-- [`libc`](https://github.com/rust-lang/libc) — `ioctl` for `HIDIOCSFEATURE`, `poll`
+- [`hidraw`](https://github.com/GregDuhamel/hidraw) — the hidraw transport: sysfs discovery, feature-report ioctls, poll with timeout, device-gone detection (git dependency, pinned to a release tag)
 - [`uhid-battery`](https://github.com/GregDuhamel/uhid-battery) — the virtual HID battery behind `--upower` (git dependency, pinned to a release tag)
+
+No `libc`: the system calls go through the two crates above, built on `rustix`, and razerd builds with `unsafe_code = "deny"`. The one `unsafe` block, explicitly allowed in `src/uhid.rs`, is the call that takes the `/dev/uhid` descriptor systemd passed and removes the `LISTEN_*` variables from the environment — sound only because razerd is single-threaded at that point.
 
 ## License
 
