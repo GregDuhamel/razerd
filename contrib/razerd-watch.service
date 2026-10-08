@@ -11,6 +11,11 @@ Documentation=https://github.com/GregDuhamel/razerd#holding-a-color---hold-and--
 # the moment the mouse wakes, instead of re-firing on a fixed timer.
 # Type=exec: a missing binary fails the start instead of a "started" unit.
 Type=exec
+# Logs go to the journal with journald priorities: `journalctl --user -p
+# warning -u razerd-watch` shows the warnings alone. info is the default
+# (start, stop); RUST_LOG=debug here, or `-v` on the ExecStart= line, adds
+# every re-apply.
+Environment=RUST_LOG=info
 ExecStart=/usr/local/bin/razerd --watch blue
 Restart=on-failure
 RestartSec=5
