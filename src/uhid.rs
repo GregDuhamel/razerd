@@ -43,8 +43,17 @@ pub(crate) fn identity() -> Identity {
 /// us the descriptor (`OpenFile=/dev/uhid:uhid` in the unit), so the process
 /// itself needs no privilege. Without that — a root shell, for debugging —
 /// open the node directly.
+#[expect(
+    unsafe_code,
+    reason = "Handle::inherited unsets LISTEN_* from the environment"
+)]
 pub(crate) fn open() -> Result<Handle> {
-    if let Some(handle) = Handle::inherited(INHERITED_FD_NAME).pop() {
+    // SAFETY: `inherited` removes `LISTEN_PID`/`LISTEN_FDS`/`LISTEN_FDNAMES`
+    // from the environment, which is only sound while no other thread can be
+    // reading it. razerd is single-threaded and this runs from `main` before
+    // anything else is started.
+    let inherited = unsafe { Handle::inherited(INHERITED_FD_NAME) };
+    if let Some(handle) = inherited.into_iter().next() {
         return Ok(handle);
     }
     Handle::open(DEV_UHID).with_context(|| {
