@@ -1,25 +1,35 @@
-//! Hidraw transport: device discovery via sysfs, feature-report ioctls, and
-//! the send/poll exchange the Razer firmware expects.
+//! The dock's hidraw interface: finding and opening it, and the feature-report
+//! exchange the Razer firmware expects.
+//!
+//! The transport is the [`hidraw`] crate: it lists the nodes through sysfs,
+//! issues the feature-report ioctls, waits for input with a timeout, and
+//! tells an unplugged device from a transfer that merely failed. What stays
+//! here is the Razer side of it: which node is the dock's control interface,
+//! the report-ID byte in front of every 90-byte report, and the send/poll
+//! exchange with its status codes and response-correlation check.
 
-use std::fs::{File, OpenOptions};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsFd, BorrowedFd};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use hidraw::{Bus, Device, Filter, Node};
 
 use crate::protocol::REPORT_LEN;
 
-const RAZER_VENDOR_ID: u16 = 0x1532;
+pub(crate) const RAZER_VENDOR_ID: u16 = 0x1532;
 const MOUSE_DOCK_PRO_PRODUCT_ID: u16 = 0x00A4;
 const DOCK_INTERFACE: u8 = 0;
-const HID_SYSFS_ROOT: &str = "/sys/class/hidraw";
-const DEV_ROOT: &str = "/dev";
 
-// Bus type in the `HID_ID=bus:vendor:product` field of a HID device's uevent
-// (`BUS_USB` in linux/input.h): the dock must be the USB one, not a
-// Bluetooth or uhid device bearing the same vendor/product ids.
-const HID_BUS_USB: u16 = 0x0003;
+// The dock's control interface among the nodes sysfs lists: the USB one —
+// not the mouse paired over Bluetooth nor the virtual battery `--upower`
+// publishes through uhid, which bear the same vendor/product ids — and the
+// first of its three interfaces.
+const DOCK_FILTER: Filter = Filter::new()
+    .bus(Bus::Usb)
+    .vendor(RAZER_VENDOR_ID)
+    .product(MOUSE_DOCK_PRO_PRODUCT_ID)
+    .interface(DOCK_INTERFACE);
 
 // The firmware writes a status code into byte 0 of the response once it has
 // processed a request (and, for mouse queries, completed the RF round-trip).
@@ -29,106 +39,66 @@ const HID_BUS_USB: u16 = 0x0003;
 pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
 const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
-// The hidraw driver queues at most this many input reports per open handle
-// (HIDRAW_BUFFER_SIZE), dropping the oldest beyond that.
-const HIDRAW_BUFFER_REPORTS: usize = 64;
-
 // Response status byte (`response[0]`) values used by the Razer firmware.
 const STATUS_NEW: u8 = 0x00; // not processed yet
 const STATUS_BUSY: u8 = 0x01; // accepted, still working (RF round-trip pending)
 const STATUS_OK: u8 = 0x02; // completed, payload valid
 
-// Linux hidraw ioctl numbers: _IOC(_IOC_WRITE|_IOC_READ, 'H', {0x06,0x07}, len)
-const fn hidioc_set_feature(len: usize) -> u64 {
-    (3u64 << 30) | ((b'H' as u64) << 8) | 0x06 | ((len as u64) << 16)
-}
-
-const fn hidioc_get_feature(len: usize) -> u64 {
-    (3u64 << 30) | ((b'H' as u64) << 8) | 0x07 | ((len as u64) << 16)
-}
-
-/// Owned handle over a `/dev/hidraw*` node, with typed feature-report I/O.
+/// The open control interface of the dock, with typed feature-report I/O.
+///
+/// A thin wrapper over [`hidraw::Device`]: it adds the report-ID byte the
+/// kernel wants in front of a Razer report, keeps the `anyhow` contexts the
+/// actions print, and carries the exchange protocol.
 pub(crate) struct HidrawDevice {
-    file: File,
-    path: PathBuf,
+    device: Device,
 }
 
 /// The raw handle, for callers that multiplex the input stream with other
 /// descriptors (`poll` alongside the uhid device) rather than read it here.
 impl AsFd for HidrawDevice {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.file.as_fd()
+        self.device.as_fd()
     }
 }
 
 impl HidrawDevice {
     /// Open the Mouse Dock Pro's control interface.
     pub(crate) fn open_dock() -> Result<Self> {
-        let path = find_hidraw(
-            Path::new(HID_SYSFS_ROOT),
-            RAZER_VENDOR_ID,
-            MOUSE_DOCK_PRO_PRODUCT_ID,
-            DOCK_INTERFACE,
-        )
-        .context("Razer Mouse Dock Pro not detected")?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("cannot open {} — check udev permissions", path.display()))?;
-        Ok(Self { file, path })
+        let node = find_dock().context("Razer Mouse Dock Pro not detected")?;
+        let device = Device::open(&node.path).with_context(|| {
+            format!(
+                "cannot open {} — check udev permissions",
+                node.path.display()
+            )
+        })?;
+        Ok(Self { device })
     }
 
     /// The `/dev/hidraw*` node this handle was opened on.
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        self.device.path()
     }
 
     /// Send a 90-byte HID feature report (`SET_REPORT` with type=feature, id=0).
     ///
     /// The hidraw ioctl buffer is `[report_id, ...90 bytes...]`; the kernel
     /// strips the report id and issues the USB control transfer.
-    #[expect(unsafe_code, reason = "libc::ioctl until the rustix migration")]
     pub(crate) fn send_feature(&self, report: &[u8; REPORT_LEN]) -> Result<()> {
         let mut buf = [0u8; REPORT_LEN + 1];
         buf[1..].copy_from_slice(report);
-
-        // SAFETY: `self.file` is an owned, valid fd; `buf` is a unique mutable
-        // array of exactly the byte-length we pass to the ioctl; the kernel
-        // hidraw driver accepts the call and returns either ≥0 on success or
-        // -1 on failure (with errno set).
-        let ret = unsafe {
-            libc::ioctl(
-                self.file.as_raw_fd(),
-                hidioc_set_feature(buf.len()),
-                buf.as_mut_ptr(),
-            )
-        };
-        if ret < 0 {
-            // Keep the io::Error in the chain: callers tell a vanished dock
-            // (ENODEV) from a mouse that merely does not answer.
-            return Err(std::io::Error::last_os_error()).context("HIDIOCSFEATURE failed");
-        }
-        Ok(())
+        // Keep the io::Error in the chain: callers tell a vanished dock
+        // (ENODEV) from a mouse that merely does not answer.
+        self.device
+            .set_feature(&buf)
+            .context("HIDIOCSFEATURE failed")
     }
 
     /// Read the current 90-byte feature report (`GET_REPORT` with type=feature).
-    #[expect(unsafe_code, reason = "libc::ioctl until the rustix migration")]
     fn get_feature(&self) -> Result<[u8; REPORT_LEN]> {
         let mut buf = [0u8; REPORT_LEN + 1];
-
-        // SAFETY: same invariants as `send_feature`; `HIDIOCGFEATURE` writes at
-        // most `buf.len()` bytes into `buf`.
-        let ret = unsafe {
-            libc::ioctl(
-                self.file.as_raw_fd(),
-                hidioc_get_feature(buf.len()),
-                buf.as_mut_ptr(),
-            )
-        };
-        if ret < 0 {
-            return Err(std::io::Error::last_os_error()).context("HIDIOCGFEATURE failed");
-        }
+        self.device
+            .get_feature(&mut buf)
+            .context("HIDIOCGFEATURE failed")?;
 
         let mut response = [0u8; REPORT_LEN];
         response.copy_from_slice(&buf[1..]);
@@ -142,75 +112,33 @@ impl HidrawDevice {
     /// this dock those are plain mouse-motion packets — there is no dedicated
     /// wake/sleep event — so `--watch` and `--sniff` use their mere presence
     /// (input flowing vs. silence) as the signal.
+    ///
+    /// An unplugged dock is EIO on this path, which hidraw marks as the
+    /// device being gone (see [`is_device_gone`]).
     pub(crate) fn read_input_report(&self, buf: &mut [u8]) -> Result<usize> {
-        use std::io::Read;
-        (&self.file)
-            .read(buf)
-            .map_err(|err| {
-                // The kernel answers `read()` on a hidraw whose device was
-                // unplugged with EIO (`hidraw_read`, `!list->hidraw->exist`)
-                // rather than ENODEV: on this path EIO is the node's
-                // obituary, not a transfer error, so mark it as such.
-                if err.raw_os_error() == Some(libc::EIO) {
-                    anyhow::Error::new(ReadOnGoneDevice(err))
-                } else {
-                    anyhow::Error::new(err)
-                }
-            })
-            .context("reading hidraw input report")
+        self.device.read(buf).context("reading hidraw input report")
     }
 
     /// Wait until an input report is queued or `deadline` passes; `true` means
     /// input is pending. Long-running actions use it as a "the mouse is being
     /// moved" signal without consuming the stream report by report.
     pub(crate) fn wait_for_input(&self, deadline: Instant) -> Result<bool> {
-        loop {
-            // Recomputed each turn: a signal cuts a poll short.
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if self.poll_input(remaining)? {
-                return Ok(true);
-            }
-            if remaining.is_zero() {
-                return Ok(false);
-            }
-        }
+        // One `poll(POLLIN)`, taken up again with the time left when a signal
+        // cuts it short — hidraw's business.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        self.device
+            .wait_readable(remaining)
+            .with_context(|| format!("poll on {} failed", self.path().display()))
     }
 
     /// Discard every queued input report without blocking. The kernel keeps at
-    /// most 64 per open handle, so this is bounded even while the mouse moves.
+    /// most [`hidraw::INPUT_QUEUE_LEN`] (64) per open handle, and one pass is
+    /// bounded by that, so this is bounded even while the mouse moves.
     pub(crate) fn drain_input_reports(&self) -> Result<()> {
-        let mut buf = [0u8; 64];
-        for _ in 0..HIDRAW_BUFFER_REPORTS {
-            if !self.poll_input(Duration::ZERO)? {
-                break;
-            }
-            self.read_input_report(&mut buf)?;
-        }
+        self.device
+            .drain()
+            .context("draining hidraw input reports")?;
         Ok(())
-    }
-
-    /// One `poll(POLLIN)` on the handle; `false` on timeout or a benign signal.
-    #[expect(unsafe_code, reason = "libc::poll until the rustix migration")]
-    fn poll_input(&self, timeout: Duration) -> Result<bool> {
-        let mut pfd = libc::pollfd {
-            fd: self.file.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // Rounded up: a sub-millisecond remainder must sleep, not spin.
-        let timeout_ms = libc::c_int::try_from(timeout.as_nanos().div_ceil(1_000_000))
-            .unwrap_or(libc::c_int::MAX);
-        // SAFETY: one valid pollfd over an owned fd; the kernel only writes
-        // `revents`. A negative return means error, with errno set.
-        let ret = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(err).with_context(|| format!("poll on {} failed", self.path.display()));
-        }
-        Ok(ret > 0)
     }
 
     /// Send a request and poll for the matching 90-byte response, returning it
@@ -265,6 +193,21 @@ impl HidrawDevice {
     }
 }
 
+/// The dock's control-interface node, as sysfs lists it — the first one, as
+/// before, should two docks ever be plugged in.
+fn find_dock() -> Result<Node> {
+    hidraw::discover(&DOCK_FILTER)
+        .with_context(|| format!("cannot read {}", hidraw::SYSFS_ROOT))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            anyhow!(
+                "no hidraw for {RAZER_VENDOR_ID:04x}:{MOUSE_DOCK_PRO_PRODUCT_ID:04x} \
+                 interface {DOCK_INTERFACE} — device not connected?"
+            )
+        })
+}
+
 /// Is a completed `response` ours, given what the buffer held before the
 /// request (`leftover`) and whether a NEW/BUSY status was observed since?
 /// Any byte that differs from the leftover proves the buffer was rewritten;
@@ -277,38 +220,19 @@ fn is_fresh_reply(
     saw_pending || response != leftover
 }
 
-/// Marker for an EIO from `read()`: there, unlike on the ioctls, it means the
-/// device behind the node is gone (see `HidrawDevice::read_input_report`).
-#[derive(Debug)]
-struct ReadOnGoneDevice(std::io::Error);
-
-impl std::fmt::Display for ReadOnGoneDevice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "hidraw device gone: {}", self.0)
-    }
-}
-
-impl std::error::Error for ReadOnGoneDevice {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
-
 /// Did this exchange fail because the hidraw node itself is gone (dock
 /// unplugged)? Long-running actions must exit on that — the handle will never
 /// work again — whereas a timeout, a firmware error status or a transient
 /// transfer error (EPIPE, ETIMEDOUT) only means the mouse is asleep, out of
 /// range, or the firmware busy.
 ///
-/// The ioctls report an unplugged device as ENODEV; `read()` reports it as
-/// EIO, which `read_input_report` tags as [`ReadOnGoneDevice`].
+/// The verdict is [`hidraw::is_gone`]'s — ENODEV from an ioctl, or the EIO
+/// that `read()` answers for an unplugged device and hidraw marks as such —
+/// applied to every `io::Error` in the chain.
 pub(crate) fn is_device_gone(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause.downcast_ref::<ReadOnGoneDevice>().is_some()
-            || cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.raw_os_error() == Some(libc::ENODEV))
-    })
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(hidraw::is_gone)
 }
 
 /// Outcome of inspecting a response's status byte (`response[0]`).
@@ -330,73 +254,11 @@ const fn classify_response_status(status: u8) -> ResponseStatus {
     }
 }
 
-/// Resolve `/dev/hidrawN` for the given USB vendor/product/interface by
-/// walking the hidraw class directory (`/sys/class/hidraw`; `sysfs_root` is a
-/// parameter so a fake tree can stand in for it under test).
-fn find_hidraw(
-    sysfs_root: &Path,
-    vendor_id: u16,
-    product_id: u16,
-    interface: u8,
-) -> Result<PathBuf> {
-    let mut entries: Vec<_> = std::fs::read_dir(sysfs_root)
-        .with_context(|| format!("cannot read {}", sysfs_root.display()))?
-        .collect::<std::io::Result<_>>()
-        .with_context(|| format!("cannot enumerate {}", sysfs_root.display()))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-
-    for entry in entries {
-        let Ok(uevent) = std::fs::read_to_string(entry.path().join("device/uevent")) else {
-            continue;
-        };
-        if hid_id(&uevent) != Some((HID_BUS_USB, u32::from(vendor_id), u32::from(product_id))) {
-            continue;
-        }
-        if usb_interface_number(&entry.path()) == Some(interface) {
-            return Ok(Path::new(DEV_ROOT).join(entry.file_name()));
-        }
-    }
-
-    bail!(
-        "no hidraw for {vendor_id:04x}:{product_id:04x} interface {interface} — device not connected?"
-    )
-}
-
-/// The `HID_ID=bus:vendor:product` line of a HID device's uevent, as the
-/// kernel writes it (`hid_uevent`: three hex fields, `%04X:%08X:%08X`). Parsed
-/// field by field rather than matched as text, so a stray substring can never
-/// pass for the dock.
-fn hid_id(uevent: &str) -> Option<(u16, u32, u32)> {
-    let value = uevent
-        .lines()
-        .find_map(|line| line.strip_prefix("HID_ID="))?;
-    let mut fields = value.trim().split(':');
-    let bus = u16::from_str_radix(fields.next()?, 16).ok()?;
-    let vendor = u32::from_str_radix(fields.next()?, 16).ok()?;
-    let product = u32::from_str_radix(fields.next()?, 16).ok()?;
-    if fields.next().is_some() {
-        return None;
-    }
-    Some((bus, vendor, product))
-}
-
-/// The USB interface number behind a hidraw, read from sysfs.
-///
-/// The hidraw's `device` symlink resolves to the HID device directory; the
-/// USB interface directory is the ancestor that carries `bInterfaceNumber`
-/// (`3-2:1.N` under USB, but the attribute is what defines it, not the name).
-fn usb_interface_number(hidraw_sysfs_path: &Path) -> Option<u8> {
-    let device = std::fs::canonicalize(hidraw_sysfs_path.join("device")).ok()?;
-    let attribute = device
-        .ancestors()
-        .map(|dir| dir.join("bInterfaceNumber"))
-        .find(|path| path.exists())?;
-    let text = std::fs::read_to_string(attribute).ok()?;
-    u8::from_str_radix(text.trim(), 16).ok()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::os::unix::net::UnixDatagram;
+
     use super::*;
 
     #[test]
@@ -417,13 +279,15 @@ mod tests {
 
     #[test]
     fn device_gone_is_enodev_anywhere_in_the_chain() {
-        let gone = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENODEV))
+        let enodev = rustix::io::Errno::NODEV.raw_os_error();
+        let gone = anyhow::Error::from(io::Error::from_raw_os_error(enodev))
             .context("HIDIOCSFEATURE failed")
             .context("battery level query failed");
         assert!(is_device_gone(&gone));
 
         // A stalled control transfer is transient, not a missing device.
-        let stalled = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EPIPE))
+        let epipe = rustix::io::Errno::PIPE.raw_os_error();
+        let stalled = anyhow::Error::from(io::Error::from_raw_os_error(epipe))
             .context("HIDIOCSFEATURE failed");
         assert!(!is_device_gone(&stalled));
 
@@ -432,24 +296,81 @@ mod tests {
     }
 
     /// `read()` on an unplugged hidraw fails with EIO, not ENODEV; the same
-    /// errno from an ioctl is a transfer error and must stay transient.
+    /// errno from an ioctl is a transfer error and must stay transient. The
+    /// marking is hidraw's; what is pinned here is that it survives razerd's
+    /// error chain, and that a bare EIO does not pass for it.
     #[test]
     fn device_gone_is_eio_on_read_but_not_on_ioctl() {
-        let eio = || std::io::Error::from_raw_os_error(libc::EIO);
-        let gone_on_read = anyhow::Error::new(ReadOnGoneDevice(eio()))
-            .context("reading hidraw input report")
+        let eio = rustix::io::Errno::IO.raw_os_error();
+
+        // No dock to unplug under test, and a socket cannot produce EIO; but
+        // `/proc/self/mem` at address 0, which is never mapped, answers
+        // `read(2)` with that very errno. What matters is that it comes out
+        // of `Device::read`, the path hidraw marks.
+        let mem = std::fs::File::open("/proc/self/mem").unwrap();
+        let dock = HidrawDevice {
+            device: Device::from_fd(mem, "/dev/hidraw-fake"),
+        };
+        let gone_on_read = dock
+            .read_input_report(&mut [0u8; 8])
+            .expect_err("read(2) at an unmapped address must fail")
             .context("watching for wake");
-        assert!(is_device_gone(&gone_on_read));
-        // The marker keeps the errno reachable for whoever prints the chain.
+        assert!(is_device_gone(&gone_on_read), "{gone_on_read:#}");
+        // The errno stays reachable for whoever prints the chain.
         assert!(
             gone_on_read
                 .chain()
-                .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-                .any(|io| io.raw_os_error() == Some(libc::EIO))
+                .filter_map(|cause| cause.downcast_ref::<io::Error>())
+                .any(|io| io.raw_os_error() == Some(eio)),
+            "{gone_on_read:?}"
         );
 
-        let eio_on_ioctl = anyhow::Error::from(eio()).context("HIDIOCGFEATURE failed");
+        let eio_on_ioctl =
+            anyhow::Error::from(io::Error::from_raw_os_error(eio)).context("HIDIOCGFEATURE failed");
         assert!(!is_device_gone(&eio_on_ioctl));
+    }
+
+    /// A datagram socket pair stands in for the node: like hidraw, it
+    /// delivers one message per `read(2)`.
+    fn fake() -> (HidrawDevice, UnixDatagram) {
+        let (node, peer) = UnixDatagram::pair().unwrap();
+        let dock = HidrawDevice {
+            device: Device::from_fd(node, "/dev/hidraw-fake"),
+        };
+        (dock, peer)
+    }
+
+    #[test]
+    fn input_is_waited_for_then_read_or_drained() {
+        let (dock, peer) = fake();
+        assert_eq!(dock.path(), Path::new("/dev/hidraw-fake"));
+
+        // Nothing queued: a deadline already passed answers at once, a short
+        // one waits it out.
+        assert!(!dock.wait_for_input(Instant::now()).unwrap());
+        let deadline = Instant::now() + Duration::from_millis(5);
+        assert!(!dock.wait_for_input(deadline).unwrap());
+        assert!(Instant::now() >= deadline);
+
+        let mut buf = [0u8; 8];
+        peer.send(&[0, 0, 0, 0, 3, 0, 2, 0]).unwrap();
+        assert!(dock.wait_for_input(Instant::now()).unwrap());
+        assert_eq!(dock.read_input_report(&mut buf).unwrap(), 8);
+        assert_eq!(buf, [0, 0, 0, 0, 3, 0, 2, 0]);
+
+        // A burst of motion is thrown away in one call, not read one by one.
+        for _ in 0..10 {
+            peer.send(&[0; 8]).unwrap();
+        }
+        dock.drain_input_reports().unwrap();
+        assert!(!dock.wait_for_input(Instant::now()).unwrap());
+    }
+
+    /// One drain pass was bounded by the kernel's per-handle queue (64) so a
+    /// moving mouse could not keep it going; hidraw's bound must stay that.
+    #[test]
+    fn a_drain_pass_is_bounded_by_the_kernel_queue() {
+        assert_eq!(hidraw::INPUT_QUEUE_LEN, 64);
     }
 
     /// A completed reply identical to what the buffer held before the request
@@ -469,120 +390,6 @@ mod tests {
         let mut changed = leftover;
         changed[9] = 0xB0;
         assert!(is_fresh_reply(&changed, &leftover, false));
-    }
-
-    #[test]
-    fn hid_id_is_parsed_field_by_field() {
-        let uevent = "DRIVER=hid-generic\nHID_ID=0003:00001532:000000A4\nHID_NAME=Razer\n";
-        assert_eq!(hid_id(uevent), Some((HID_BUS_USB, 0x1532, 0x00A4)));
-
-        // Bluetooth (0005) and uhid (0006) devices carry the same ids.
-        assert_eq!(
-            hid_id("HID_ID=0005:00001532:000000A4\n"),
-            Some((0x0005, 0x1532, 0x00A4))
-        );
-        // Not a HID_ID line, malformed, or too many fields.
-        assert_eq!(hid_id("MODALIAS=hid:b0003g0001v00001532p000000A4\n"), None);
-        assert_eq!(hid_id("HID_ID=0003:00001532\n"), None);
-        assert_eq!(hid_id("HID_ID=0003:0000zz32:000000A4\n"), None);
-        assert_eq!(hid_id("HID_ID=0003:00001532:000000A4:0000\n"), None);
-    }
-
-    /// A fake `/sys/class/hidraw` in a temporary directory, laid out like
-    /// the kernel's: `hidrawN/device` is a symlink into the device tree,
-    /// where the USB interface directory carries `bInterfaceNumber` and the
-    /// HID device directory its `uevent`.
-    struct FakeSysfs {
-        root: PathBuf,
-    }
-
-    impl FakeSysfs {
-        fn new(name: &str) -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("razerd-test-sysfs-{name}-{}", std::process::id()));
-            std::fs::create_dir_all(root.join("class/hidraw")).unwrap();
-            Self { root }
-        }
-
-        fn class_dir(&self) -> PathBuf {
-            self.root.join("class/hidraw")
-        }
-
-        /// Add `hidrawN` for a HID device on `bus` with the given ids, on USB
-        /// interface `interface` of device `port`.
-        fn add(&self, n: u32, port: &str, interface: u8, bus: u16, vendor: u32, product: u32) {
-            let iface_dir = self
-                .root
-                .join(format!("devices/usb1/{port}/{port}:1.{interface}"));
-            let hid_dir = iface_dir.join(format!("{bus:04X}:{vendor:04X}:{product:04X}.{n:04}"));
-            std::fs::create_dir_all(&hid_dir).unwrap();
-            std::fs::write(
-                iface_dir.join("bInterfaceNumber"),
-                format!("{interface:02x}\n"),
-            )
-            .unwrap();
-            std::fs::write(
-                hid_dir.join("uevent"),
-                format!("DRIVER=hid-generic\nHID_ID={bus:04X}:{vendor:08X}:{product:08X}\n"),
-            )
-            .unwrap();
-            let hidraw_dir = self.class_dir().join(format!("hidraw{n}"));
-            std::fs::create_dir_all(&hidraw_dir).unwrap();
-            std::os::unix::fs::symlink(&hid_dir, hidraw_dir.join("device")).unwrap();
-        }
-    }
-
-    impl Drop for FakeSysfs {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-
-    #[test]
-    fn find_hidraw_picks_the_usb_interface_by_sysfs_attributes() {
-        let sysfs = FakeSysfs::new("dock");
-        // The dock's three interfaces, interleaved with lookalikes: the same
-        // ids over Bluetooth, another Razer product, a uhid device.
-        sysfs.add(0, "1-3", 1, HID_BUS_USB, 0x1532, 0x00A4);
-        sysfs.add(1, "1-4", 0, 0x0005, 0x1532, 0x00A4);
-        sysfs.add(2, "1-5", 0, HID_BUS_USB, 0x1532, 0x02B3);
-        sysfs.add(3, "1-3", 0, HID_BUS_USB, 0x1532, 0x00A4);
-        sysfs.add(4, "1-3", 2, HID_BUS_USB, 0x1532, 0x00A4);
-        sysfs.add(5, "1-6", 0, 0x0006, 0x1532, 0x00A4);
-
-        let found = find_hidraw(&sysfs.class_dir(), 0x1532, 0x00A4, 0).unwrap();
-        assert_eq!(found, Path::new("/dev/hidraw3"));
-        let found = find_hidraw(&sysfs.class_dir(), 0x1532, 0x00A4, 2).unwrap();
-        assert_eq!(found, Path::new("/dev/hidraw4"));
-
-        // Right ids, but no such interface.
-        let err = find_hidraw(&sysfs.class_dir(), 0x1532, 0x00A4, 3).unwrap_err();
-        assert!(err.to_string().contains("interface 3"), "{err}");
-    }
-
-    #[test]
-    fn find_hidraw_skips_entries_without_a_readable_uevent() {
-        let sysfs = FakeSysfs::new("partial");
-        // A node whose device vanished between the listing and the read.
-        std::fs::create_dir_all(sysfs.class_dir().join("hidraw0")).unwrap();
-        sysfs.add(1, "1-3", 0, HID_BUS_USB, 0x1532, 0x00A4);
-
-        let found = find_hidraw(&sysfs.class_dir(), 0x1532, 0x00A4, 0).unwrap();
-        assert_eq!(found, Path::new("/dev/hidraw1"));
-    }
-
-    #[test]
-    fn find_hidraw_reports_an_unreadable_class_directory() {
-        let err = find_hidraw(Path::new("/nonexistent/hidraw"), 0x1532, 0x00A4, 0).unwrap_err();
-        assert!(err.to_string().contains("cannot read"), "{err}");
-    }
-
-    /// Regression test: HIDIOCSFEATURE for a 91-byte buffer must match what
-    /// the Linux kernel expects (`_IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, 91)`).
-    #[test]
-    fn hidioc_codes_match_kernel_encoding() {
-        assert_eq!(hidioc_set_feature(91), 0xC05B_4806);
-        assert_eq!(hidioc_get_feature(91), 0xC05B_4807);
     }
 
     /// Hardware smoke test — needs the dock connected and the mouse awake.

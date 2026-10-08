@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use uhid_battery::{DEV_UHID, Handle, Identity, Reading};
 
+use crate::hid::RAZER_VENDOR_ID;
 use crate::protocol::BatteryStatus;
 
 pub(crate) use uhid_battery::{Battery, CreateErrorKind, Kind, Wakeup};
@@ -19,8 +20,7 @@ pub(crate) use uhid_battery::{Battery, CreateErrorKind, Kind, Wakeup};
 // Name of the descriptor in the unit: `OpenFile=/dev/uhid:uhid`.
 const INHERITED_FD_NAME: &str = "uhid";
 
-const RAZER_VENDOR_ID: u16 = 0x1532;
-// The Basilisk V3 Pro 35K's own (wired) product id.
+// The Basilisk V3 Pro 35K's own (wired) product id; the vendor is the dock's.
 const BASILISK_V3_PRO_35K_PRODUCT_ID: u16 = 0x00CC;
 
 // Names the power supply (`hid-razerd-battery*`). A constant rather than the

@@ -5,11 +5,13 @@
 //! firmware routes requests to itself or forwards them to the wireless mouse
 //! over the RF link based on the transaction id and report layout.
 //!
-//! Layout: [`hid`] is the hidraw transport (discovery, ioctls, send/poll
-//! exchange), [`protocol`] the Razer report format and typed queries,
-//! [`cli`] the flag surface, and [`actions`] the verb behind each flag.
-//! [`uhid`] is the one piece that does not talk to the dock: the virtual HID
-//! device `--upower` uses to hand the mouse battery to the kernel.
+//! Layout: [`hid`] is the dock's side of the hidraw transport (which node is
+//! the dock, the send/poll exchange) over the shared `hidraw` crate,
+//! [`protocol`] the Razer report format and typed queries, [`cli`] the flag
+//! surface, and [`actions`] the verb behind each flag. [`uhid`] is the one
+//! piece that does not talk to the dock: the virtual HID device `--upower`
+//! uses to hand the mouse battery to the kernel, over the shared
+//! `uhid-battery` crate.
 
 mod actions;
 mod cli;
