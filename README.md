@@ -367,7 +367,7 @@ Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 CI runs `cargo fmt --check`, `cargo check`, `cargo clippy -D warnings`, `cargo test`, `cargo doc -D warnings`, and a release build on every push to `main` and every PR targeting it.
 
-Releases are cut via the **Release** GitHub Action (`workflow_dispatch`) — pick a semver bump (patch/minor/major), the workflow computes the next version from the latest tag, bumps `Cargo.toml`, builds for `x86_64-unknown-linux-musl` (`--locked`), checks with `file` that the binary is statically linked, tags, and attaches `razerd-x86_64-linux` and its `SHA256SUMS` to the GitHub Release (see [installing the release binary](#1-build-and-install-the-binary)).
+Releases are made in two steps. The pull request bumps the version in `Cargo.toml` and `Cargo.lock` (`cargo update --workspace`), with its CHANGELOG entry. Once it is on `main`, the **Release** GitHub Action (`workflow_dispatch`) checks the two agree, refuses a version that is already tagged, builds for `x86_64-unknown-linux-musl` (`--locked`), checks with `file` that the binary is statically linked, tags `main`, and attaches `razerd-x86_64-linux` and its `SHA256SUMS` to the GitHub Release (see [installing the release binary](#1-build-and-install-the-binary)). It never commits: `main` only takes signed commits through pull requests.
 
 ## Dependencies
 
