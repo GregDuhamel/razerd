@@ -18,9 +18,51 @@ pub(crate) const TX_ID_MOUSE: u8 = 0x1F;
 pub(crate) const TX_ID_DOCK: u8 = 0xFF;
 pub(crate) const TX_ID_DOCK_LED: u8 = 0xF7;
 
+/// A command of the protocol: who it is for (the transaction id), its class
+/// and id, and the data size the firmware checks in the header — the four
+/// bytes every request repeats. The commands this hardware answers are the
+/// constants below, one line each; [`Command::report`] builds the request
+/// and [`Command::exchange`] sends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Command {
+    tx_id: u8,
+    class: u8,
+    cmd: u8,
+    data_size: u8,
+}
+
+impl Command {
+    /// A command the dock forwards to the mouse over RF — every one of them;
+    /// `--info` asks the dock itself for its serial and firmware with
+    /// [`Command::to`].
+    const fn mouse(class: u8, cmd: u8, data_size: u8) -> Self {
+        Self {
+            tx_id: TX_ID_MOUSE,
+            class,
+            cmd,
+            data_size,
+        }
+    }
+
+    /// The same command addressed to `tx_id` (`TX_ID_DOCK` for the dock).
+    const fn to(self, tx_id: u8) -> Self {
+        Self { tx_id, ..self }
+    }
+
+    /// The request: the header, `args` after it, and the checksum.
+    fn report(self, args: &[u8]) -> [u8; REPORT_LEN] {
+        build_query(self.tx_id, self.class, self.cmd, self.data_size, args)
+    }
+
+    /// Send the request through the dock and read the firmware's reply.
+    fn exchange(self, dock: &HidrawDevice, args: &[u8]) -> Result<[u8; REPORT_LEN]> {
+        dock.exchange_feature(&self.report(args))
+    }
+}
+
 pub(crate) const CLASS_DEVICE: u8 = 0x00;
-pub(crate) const CMD_GET_FIRMWARE: u8 = 0x81;
-pub(crate) const CMD_GET_SERIAL: u8 = 0x82;
+const GET_FIRMWARE: Command = Command::mouse(CLASS_DEVICE, 0x81, 0x02);
+const GET_SERIAL: Command = Command::mouse(CLASS_DEVICE, 0x82, 0x16);
 
 // First argument of DPI get/set: which storage slot to address. The firmware
 // runs from the live (RAM) slot — the Cycle Up Sensitivity Stages button
@@ -30,15 +72,16 @@ pub(crate) const CMD_GET_SERIAL: u8 = 0x82;
 pub(crate) const LIVESTORE: u8 = 0x00;
 pub(crate) const VARSTORE: u8 = 0x01;
 
-pub(crate) const CLASS_DPI: u8 = 0x04;
-pub(crate) const CMD_SET_DPI: u8 = 0x05;
-pub(crate) const CMD_GET_DPI: u8 = 0x85;
-pub(crate) const CMD_SET_DPI_STAGES: u8 = 0x06;
-pub(crate) const CMD_GET_DPI_STAGES: u8 = 0x86;
-
 // Stage table layout: [store, active_stage (1-based), count] then per stage
 // 7 bytes: index, X hi/lo, Y hi/lo, 2 reserved. 3 + 5*7 = 38 = 0x26.
 pub(crate) const DPI_STAGES_DATA_SIZE: u8 = 0x26;
+
+pub(crate) const CLASS_DPI: u8 = 0x04;
+// DPI get/set carry `[store, X be, Y be]` and two more bytes: 0x07.
+const SET_DPI: Command = Command::mouse(CLASS_DPI, 0x05, 0x07);
+const GET_DPI: Command = Command::mouse(CLASS_DPI, 0x85, 0x07);
+const SET_DPI_STAGES: Command = Command::mouse(CLASS_DPI, 0x06, DPI_STAGES_DATA_SIZE);
+const GET_DPI_STAGES: Command = Command::mouse(CLASS_DPI, 0x86, DPI_STAGES_DATA_SIZE);
 
 // The stage table `--sensitivity-stages on` installs — Synapse's defaults for
 // "Cycle Up Sensitivity Stages", stage 3 (1600) active. The firmware caps the
@@ -53,12 +96,12 @@ pub(crate) const DPI_MAX: u16 = 35_000;
 // Onboard profile slots, cycled with the button under the mouse. The
 // indicator LED next to it shows the active slot's color.
 pub(crate) const CLASS_PROFILE: u8 = 0x05;
-pub(crate) const CMD_GET_PROFILE_COUNT: u8 = 0x80;
-pub(crate) const CMD_GET_ACTIVE_PROFILE: u8 = 0x84;
+const GET_PROFILE_COUNT: Command = Command::mouse(CLASS_PROFILE, 0x80, 0x01);
+const GET_ACTIVE_PROFILE: Command = Command::mouse(CLASS_PROFILE, 0x84, 0x01);
 
 pub(crate) const CLASS_POWER: u8 = 0x07;
-pub(crate) const CMD_GET_BATTERY_LEVEL: u8 = 0x80;
-pub(crate) const CMD_GET_CHARGING: u8 = 0x84;
+const GET_BATTERY_LEVEL: Command = Command::mouse(CLASS_POWER, 0x80, 0x02);
+const GET_CHARGING: Command = Command::mouse(CLASS_POWER, 0x84, 0x02);
 
 pub(crate) const CLASS_EXTENDED_MATRIX: u8 = 0x0F;
 pub(crate) const CMD_SET_MATRIX_EFFECT: u8 = 0x03;
@@ -190,23 +233,11 @@ impl std::fmt::Display for BatteryStatus {
 }
 
 pub(crate) fn query_battery(dock: &HidrawDevice) -> Result<BatteryStatus> {
-    let level = dock
-        .exchange_feature(&build_query(
-            TX_ID_MOUSE,
-            CLASS_POWER,
-            CMD_GET_BATTERY_LEVEL,
-            0x02,
-            &[],
-        ))
+    let level = GET_BATTERY_LEVEL
+        .exchange(dock, &[])
         .context("battery level query failed")?;
-    let charge = dock
-        .exchange_feature(&build_query(
-            TX_ID_MOUSE,
-            CLASS_POWER,
-            CMD_GET_CHARGING,
-            0x02,
-            &[],
-        ))
+    let charge = GET_CHARGING
+        .exchange(dock, &[])
         .context("charging status query failed")?;
 
     Ok(BatteryStatus {
@@ -221,9 +252,11 @@ fn parse_battery_percent(raw: u8) -> u8 {
     u8::try_from(u32::from(raw) * 100 / 255).unwrap_or(100)
 }
 
+/// The serial of the mouse (`TX_ID_MOUSE`) or of the dock (`TX_ID_DOCK`).
 pub(crate) fn query_serial(dock: &HidrawDevice, tx_id: u8) -> Result<String> {
-    let resp = dock
-        .exchange_feature(&build_query(tx_id, CLASS_DEVICE, CMD_GET_SERIAL, 0x16, &[]))
+    let resp = GET_SERIAL
+        .to(tx_id)
+        .exchange(dock, &[])
         .context("serial query failed")?;
     Ok(parse_serial(&resp))
 }
@@ -247,15 +280,11 @@ impl std::fmt::Display for FirmwareVersion {
     }
 }
 
+/// The firmware of the mouse (`TX_ID_MOUSE`) or of the dock (`TX_ID_DOCK`).
 pub(crate) fn query_firmware(dock: &HidrawDevice, tx_id: u8) -> Result<FirmwareVersion> {
-    let resp = dock
-        .exchange_feature(&build_query(
-            tx_id,
-            CLASS_DEVICE,
-            CMD_GET_FIRMWARE,
-            0x02,
-            &[],
-        ))
+    let resp = GET_FIRMWARE
+        .to(tx_id)
+        .exchange(dock, &[])
         .context("firmware query failed")?;
     Ok(FirmwareVersion {
         major: resp[8],
@@ -291,23 +320,11 @@ const fn profile_color_name(slot: u8) -> Option<&'static str> {
 }
 
 pub(crate) fn query_profiles(dock: &HidrawDevice) -> Result<ProfileInfo> {
-    let count = dock
-        .exchange_feature(&build_query(
-            TX_ID_MOUSE,
-            CLASS_PROFILE,
-            CMD_GET_PROFILE_COUNT,
-            0x01,
-            &[],
-        ))
+    let count = GET_PROFILE_COUNT
+        .exchange(dock, &[])
         .context("profile count query failed")?;
-    let active = dock
-        .exchange_feature(&build_query(
-            TX_ID_MOUSE,
-            CLASS_PROFILE,
-            CMD_GET_ACTIVE_PROFILE,
-            0x01,
-            &[],
-        ))
+    let active = GET_ACTIVE_PROFILE
+        .exchange(dock, &[])
         .context("active profile query failed")?;
 
     Ok(ProfileInfo {
@@ -319,14 +336,8 @@ pub(crate) fn query_profiles(dock: &HidrawDevice) -> Result<ProfileInfo> {
 pub(crate) fn query_dpi(dock: &HidrawDevice) -> Result<(u16, u16)> {
     // Read the live slot: it reflects DPI-button presses, the stored slot
     // doesn't. Response carries X/Y as big-endian u16 pairs after the store byte.
-    let resp = dock
-        .exchange_feature(&build_query(
-            TX_ID_MOUSE,
-            CLASS_DPI,
-            CMD_GET_DPI,
-            0x07,
-            &[LIVESTORE],
-        ))
+    let resp = GET_DPI
+        .exchange(dock, &[LIVESTORE])
         .context("DPI query failed")?;
     Ok(parse_dpi(&resp))
 }
@@ -404,14 +415,8 @@ fn parse_dpi_stages(resp: &[u8; REPORT_LEN]) -> DpiStages {
 
 pub(crate) fn query_dpi_stages(dock: &HidrawDevice) -> Result<DpiStages> {
     // Live slot: the table the button actually cycles.
-    let resp = dock
-        .exchange_feature(&build_query(
-            TX_ID_MOUSE,
-            CLASS_DPI,
-            CMD_GET_DPI_STAGES,
-            DPI_STAGES_DATA_SIZE,
-            &[LIVESTORE],
-        ))
+    let resp = GET_DPI_STAGES
+        .exchange(dock, &[LIVESTORE])
         .context("DPI stage table query failed")?;
     Ok(parse_dpi_stages(&resp))
 }
@@ -436,27 +441,16 @@ pub(crate) fn set_dpi(dock: &HidrawDevice, dpi: u16) -> Result<()> {
 /// `[store, X be, Y be]` with the same value on both axes.
 fn set_dpi_query(store: u8, dpi: u16) -> [u8; REPORT_LEN] {
     let [hi, lo] = dpi.to_be_bytes();
-    build_query(
-        TX_ID_MOUSE,
-        CLASS_DPI,
-        CMD_SET_DPI,
-        0x07,
-        &[store, hi, lo, hi, lo],
-    )
+    SET_DPI.report(&[store, hi, lo, hi, lo])
 }
 
 /// Write the onboard stage table (the one the Cycle Up Sensitivity Stages
 /// button cycles) to both the live and stored slots.
 pub(crate) fn set_dpi_stages(dock: &HidrawDevice, active: u8, stages: &[u16]) -> Result<()> {
     for store in [LIVESTORE, VARSTORE] {
-        dock.exchange_feature(&build_query(
-            TX_ID_MOUSE,
-            CLASS_DPI,
-            CMD_SET_DPI_STAGES,
-            DPI_STAGES_DATA_SIZE,
-            &dpi_stages_args(store, active, stages),
-        ))
-        .with_context(|| format!("DPI stage table write failed ({} slot)", slot_name(store)))?;
+        SET_DPI_STAGES
+            .exchange(dock, &dpi_stages_args(store, active, stages))
+            .with_context(|| format!("DPI stage table write failed ({} slot)", slot_name(store)))?;
     }
     Ok(())
 }
@@ -530,24 +524,61 @@ mod tests {
 
     #[test]
     fn build_query_places_fields_correctly() {
-        let q = build_query(TX_ID_MOUSE, CLASS_POWER, CMD_GET_BATTERY_LEVEL, 0x02, &[]);
+        let q = build_query(TX_ID_MOUSE, CLASS_POWER, 0x80, 0x02, &[]);
         assert_eq!(q[1], TX_ID_MOUSE);
         assert_eq!(q[5], 0x02);
         assert_eq!(q[6], CLASS_POWER);
-        assert_eq!(q[7], CMD_GET_BATTERY_LEVEL);
+        assert_eq!(q[7], 0x80);
         assert_eq!(q[88], compute_crc(&q));
     }
 
     #[test]
     fn build_query_copies_arguments() {
-        let q = build_query(
-            TX_ID_MOUSE,
-            CLASS_DPI,
-            CMD_GET_DPI,
-            0x07,
-            &[0x01, 0x02, 0x03],
-        );
+        let q = build_query(TX_ID_MOUSE, CLASS_DPI, 0x85, 0x07, &[0x01, 0x02, 0x03]);
         assert_eq!(&q[8..11], &[0x01, 0x02, 0x03]);
+    }
+
+    /// Every command, byte for byte what went out before the table: the
+    /// header `[tx_id, data_size, class, cmd]` at bytes 1, 5, 6, 7 — the
+    /// firmware checks the size — against the values the queries used to
+    /// spell out, and the whole report what `build_query` makes of them.
+    #[test]
+    fn each_command_sends_the_header_it_always_did() {
+        for (command, args, expected) in [
+            (GET_BATTERY_LEVEL, &[][..], [0x1F, 0x02, 0x07, 0x80]),
+            (GET_CHARGING, &[], [0x1F, 0x02, 0x07, 0x84]),
+            (GET_SERIAL, &[], [0x1F, 0x16, 0x00, 0x82]),
+            (GET_SERIAL.to(TX_ID_DOCK), &[], [0xFF, 0x16, 0x00, 0x82]),
+            (GET_FIRMWARE, &[], [0x1F, 0x02, 0x00, 0x81]),
+            (GET_FIRMWARE.to(TX_ID_DOCK), &[], [0xFF, 0x02, 0x00, 0x81]),
+            (GET_PROFILE_COUNT, &[], [0x1F, 0x01, 0x05, 0x80]),
+            (GET_ACTIVE_PROFILE, &[], [0x1F, 0x01, 0x05, 0x84]),
+            (GET_DPI, &[LIVESTORE], [0x1F, 0x07, 0x04, 0x85]),
+            (
+                SET_DPI,
+                &[VARSTORE, 0x07, 0x08, 0x07, 0x08],
+                [0x1F, 0x07, 0x04, 0x05],
+            ),
+            (GET_DPI_STAGES, &[LIVESTORE], [0x1F, 0x26, 0x04, 0x86]),
+            (
+                SET_DPI_STAGES,
+                &[VARSTORE, 1, 1, 1, 0x07, 0x08, 0x07, 0x08, 0, 0],
+                [0x1F, 0x26, 0x04, 0x06],
+            ),
+        ] {
+            let [tx_id, data_size, class, cmd] = expected;
+            let report = command.report(args);
+            assert_eq!(
+                [report[1], report[5], report[6], report[7]],
+                expected,
+                "{command:?}"
+            );
+            assert_eq!(
+                report,
+                build_query(tx_id, class, cmd, data_size, args),
+                "{command:?}"
+            );
+        }
     }
 
     #[test]
@@ -602,7 +633,7 @@ mod tests {
         assert_eq!(q[1], TX_ID_MOUSE);
         assert_eq!(q[5], 0x07);
         assert_eq!(q[6], CLASS_DPI);
-        assert_eq!(q[7], CMD_SET_DPI);
+        assert_eq!(q[7], 0x05);
         // varstore, then 1800 (0x0708) big-endian on both axes.
         assert_eq!(&q[8..13], &[0x01, 0x07, 0x08, 0x07, 0x08]);
         assert_eq!(q[88], compute_crc(&q));
@@ -630,16 +661,10 @@ mod tests {
             vec![0x01, 0x01, 0x01, 0x01, 0x07, 0x08, 0x07, 0x08, 0x00, 0x00]
         );
 
-        let q = build_query(
-            TX_ID_MOUSE,
-            CLASS_DPI,
-            CMD_SET_DPI_STAGES,
-            DPI_STAGES_DATA_SIZE,
-            &args,
-        );
+        let q = SET_DPI_STAGES.report(&args);
         assert_eq!(q[5], 0x26);
         assert_eq!(q[6], CLASS_DPI);
-        assert_eq!(q[7], CMD_SET_DPI_STAGES);
+        assert_eq!(q[7], 0x06);
         assert_eq!(q[88], compute_crc(&q));
     }
 
