@@ -26,7 +26,7 @@ log = "0.4"
 # virtual battery before exiting. Only the flag module: no iterator, no
 # channel, no thread.
 signal-hook = { version = "0.4", default-features = false }
-uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.4.0" }
+uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.4.1" }
 
 [dev-dependencies]
 # The errno values (ENODEV, EIO, EPIPE) the device-gone tests build errors
